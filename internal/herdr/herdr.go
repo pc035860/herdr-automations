@@ -275,14 +275,18 @@ func AgentPrompt(target, text string, timeout time.Duration) error {
 // observed: the text reached the agent's input but nothing happened.
 func PromptStalled(err error) bool { return hasCode(err, codePromptStalled) }
 
-// AgentSubmit presses Enter in the agent's input, then waits for it to settle.
-// Recovery for a stalled prompt: the text is already typed, so re-prompting
-// would type it a second time.
-func AgentSubmit(target string, timeout time.Duration) error {
-	if err := run(nil, "agent", "send-keys", target, "Enter"); err != nil {
-		return err
-	}
-	return AgentWait(target, timeout)
+// AgentSubmit presses Enter in the agent's input. Recovery for a stalled
+// prompt: the text may already be typed, and re-prompting would type it twice.
+func AgentSubmit(target string) error {
+	return run(nil, "agent", "send-keys", target, "Enter")
+}
+
+// AgentWorking waits for the agent to start working. Settling proves nothing
+// about a submission — an agent that never received one is idle too — so this
+// is the only positive evidence that a prompt was taken.
+func AgentWorking(target string, timeout time.Duration) error {
+	return run(nil, "agent", "wait", target, "--until", "working",
+		"--timeout", strconv.FormatInt(timeout.Milliseconds(), 10))
 }
 
 // Agent states herdr reports. StatusBlocked is the one that matters most: an

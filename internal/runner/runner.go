@@ -445,11 +445,7 @@ func (j *journal) execute(a config.Automation) error {
 	if err := herdr.AgentWait(paneID, agentReadyWait); err != nil {
 		return fmt.Errorf("wait for %s agent: %w", a.Agent, err)
 	}
-	err := herdr.AgentPrompt(paneID, a.Prompt, timeout)
-	if herdr.PromptStalled(err) {
-		err = herdr.AgentSubmit(paneID, timeout)
-	}
-	if err != nil {
+	if err := submit(paneID, a.Prompt, timeout); err != nil {
 		return fmt.Errorf("prompt: %w", err)
 	}
 	// Settling covers idle, done *and* blocked, and a blocked agent is waiting
@@ -476,6 +472,43 @@ func (j *journal) execute(a config.Automation) error {
 // shellPoll is how often a delegated workflow's pane is checked for the shell
 // prompt coming back.
 const shellPoll = 2 * time.Second
+
+// promptAcceptWait is how long the agent has to visibly start working after a
+// recovered submission. Only reached when the first attempt already stalled,
+// so an agent that answers faster than this cannot be mistaken for a silent
+// one — it would not have stalled in the first place.
+const promptAcceptWait = 15 * time.Second
+
+// submit gets the prompt into the agent and proves the agent took it.
+//
+// An agent that never received a prompt sits at idle, which is also what a
+// finished one looks like, so settling proves nothing on its own. A run was
+// recorded done having asked the agent nothing at all: herdr reports the agent
+// idle while its TUI is still mounting, and typing into that window loses the
+// text outright, not just the Enter that follows it.
+func submit(paneID, prompt string, timeout time.Duration) error {
+	err := herdr.AgentPrompt(paneID, prompt, timeout)
+	if !herdr.PromptStalled(err) {
+		return err // accepted, or failed for a reason worth reporting
+	}
+
+	// The text may be sitting in the input with only its Enter swallowed, so
+	// press Enter before considering typing it again.
+	if err := herdr.AgentSubmit(paneID); err != nil {
+		return err
+	}
+	if err := herdr.AgentWorking(paneID, promptAcceptWait); err == nil {
+		return herdr.AgentWait(paneID, timeout)
+	}
+
+	// Nothing started, so the text never landed either and the input is empty:
+	// safe to type it, and necessary — otherwise this run reports success
+	// having done nothing.
+	if err := herdr.AgentPrompt(paneID, prompt, timeout); err != nil {
+		return fmt.Errorf("the agent never accepted it: %w", err)
+	}
+	return nil
+}
 
 // startGrace is how long the shell has to pick up a submitted command before
 // an idle pane is believed.
