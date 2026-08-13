@@ -29,6 +29,8 @@ const (
 	codePromptStalled = "agent_prompt_stalled"
 	codeWorkspaceGone = "workspace_not_found"
 	codeTabGone       = "tab_not_found"
+	codeAgentGone     = "agent_not_found"
+	codePaneGone      = "pane_not_found"
 )
 
 // APIError is herdr's structured error, kept structured. Matching on the
@@ -65,9 +67,18 @@ func output(args ...string) ([]byte, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return nil, apiError(strings.Join(args, " "), stdout.Bytes(), stderr.String())
+		// Only the subcommand names the failure. The rest of argv holds the
+		// automation's prompt, which would otherwise reach the run log, the
+		// board's status line and the daemon's stderr on every failure.
+		return nil, apiError(subcommand(args), stdout.Bytes(), stderr.String())
 	}
 	return stdout.Bytes(), nil
+}
+
+// subcommand is the leading verb pair of an argv ("agent prompt"), which is
+// all of it that is safe to quote back.
+func subcommand(args []string) string {
+	return strings.Join(args[:min(2, len(args))], " ")
 }
 
 // run executes a herdr subcommand and decodes the socket-API JSON envelope
@@ -272,6 +283,47 @@ func AgentSubmit(target string, timeout time.Duration) error {
 		return err
 	}
 	return AgentWait(target, timeout)
+}
+
+// Agent states herdr reports. StatusBlocked is the one that matters most: an
+// agent waiting on a question has stopped, but it is not finished.
+const (
+	StatusWorking = "working"
+	StatusBlocked = "blocked"
+)
+
+// AgentStatus reports the state of the agent in a pane, or "" when the pane
+// holds no agent — a plain shell, or one whose agent has exited.
+func AgentStatus(paneID string) (string, error) {
+	var res struct {
+		Agent struct {
+			Status string `json:"agent_status"`
+		} `json:"agent"`
+	}
+	if err := run(&res, "agent", "get", paneID); err != nil {
+		if hasCode(err, codeAgentGone, codePaneGone) {
+			return "", nil
+		}
+		return "", err
+	}
+	return res.Agent.Status, nil
+}
+
+// PaneBusy reports whether a pane is still running a foreground command rather
+// than sitting at its shell prompt. This is how a delegated workflow — which
+// is a command, not an agent — is known to be finished.
+func PaneBusy(paneID string) (bool, error) {
+	var res struct {
+		ProcessInfo struct {
+			ForegroundGroup int `json:"foreground_process_group_id"`
+			ShellPID        int `json:"shell_pid"`
+		} `json:"process_info"`
+	}
+	if err := run(&res, "pane", "process-info", "--pane", paneID); err != nil {
+		return false, err
+	}
+	info := res.ProcessInfo
+	return info.ForegroundGroup != 0 && info.ForegroundGroup != info.ShellPID, nil
 }
 
 // ErrGone means the run's workspace no longer exists — the expected outcome

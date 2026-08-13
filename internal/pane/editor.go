@@ -5,13 +5,16 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strconv"
+	"strings"
 )
 
 // pagerCommand shows a captured run's output. A pager, not $EDITOR: this is
 // a terminal transcript to scroll, not a file to change.
 func pagerCommand(path string) *exec.Cmd {
-	if pager := os.Getenv("PAGER"); pager != "" {
-		return exec.Command(pager, path)
+	// $PAGER routinely carries flags ("less -R"), so it is a command line, not
+	// an executable name.
+	if pager := strings.Fields(os.Getenv("PAGER")); len(pager) > 0 {
+		return exec.Command(pager[0], append(pager[1:], path)...)
 	}
 	if _, err := exec.LookPath("less"); err == nil {
 		return exec.Command("less", "-R", path)

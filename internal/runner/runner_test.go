@@ -45,6 +45,15 @@ func TestExpiredKeepsTheNewestAndAllowsFailuresMore(t *testing.T) {
 	if got := ids(expired(runs, 0, 0)); !slices.Equal(got, []string{"5", "4", "3", "1"}) {
 		t.Errorf("expired(keep 0) = %v, want [5 4 3 1]", got)
 	}
+	// Negative means never retire — not "a negative budget", which would
+	// retire every failure instead. keep 0 must still retire, so the two
+	// cannot be the same number internally.
+	if got := ids(expired(runs, 1, -1)); !slices.Equal(got, []string{"5", "3"}) {
+		t.Errorf("expired(keepFailed -1) = %v, want the failures kept", got)
+	}
+	if got := expired(runs, -1, -1); len(got) != 0 {
+		t.Errorf("expired(all negative) = %v, want nothing retired", ids(got))
+	}
 }
 
 func TestAgentNameIsUniquePerRunAndFitsHerdrsLimit(t *testing.T) {

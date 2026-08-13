@@ -102,6 +102,16 @@ func Run(a config.Automation, trigger string) error {
 	gate.acquire()
 	defer gate.release()
 
+	// The queue can be long — max_concurrent 2 against ten automations sharing
+	// an occurrence, each bounded only by timeout_minutes. The window was
+	// checked before queueing; check it again now that we know how long the
+	// wait actually was, rather than starting a run hours past its point.
+	if window := a.CatchUp(); window > 0 && time.Since(j.start) > window {
+		j.record(history.StatusMissed, fmt.Sprintf("queued %s, past the %s catch-up window",
+			time.Since(j.start).Round(time.Minute), window))
+		return fmt.Errorf("%s: queued past its catch-up window", a.Name)
+	}
+
 	if err := j.provision(a); err != nil {
 		j.record(history.StatusFailed, err.Error())
 		return err
@@ -109,22 +119,34 @@ func Run(a config.Automation, trigger string) error {
 	j.record(history.StatusRunning, "")
 
 	if err := j.execute(a); err != nil {
-		j.capture()
+		saved := j.capture()
 		j.record(history.StatusFailed, err.Error())
 		j.relabel(history.StatusFailed)
+		j.retireNow(a.KeepFailedCount(), saved)
 		return err
 	}
-	j.capture()
+	saved := j.capture()
 	j.record(history.StatusDone, "")
 	j.relabel(history.StatusDone)
-	if a.KeepCount() == 0 {
-		// Nothing here is meant to be read, so don't make the user wait until
-		// the next occurrence for the pane to go.
-		if err := release(j.rec); err != nil {
-			log.Printf("%s: closing the finished run: %v", a.Name, err)
-		}
-	}
+	j.retireNow(a.KeepCount(), saved)
 	return nil
+}
+
+// retireNow closes this run's own pane when its budget is zero — nothing here
+// is meant to be read, so don't make the user wait for the next occurrence.
+// A pane whose output could not be saved is kept regardless: it is the only
+// remaining copy, and the next run will try again.
+func (j *journal) retireNow(keep int, saved bool) {
+	if keep != 0 {
+		return
+	}
+	if !saved {
+		log.Printf("%s: keeping the pane, its output was not saved", j.rec.Automation)
+		return
+	}
+	if err := release(j.rec); err != nil {
+		log.Printf("%s: closing the finished run: %v", j.rec.Automation, err)
+	}
 }
 
 // runLabel names a run's pane. The clock time is the load-bearing part: tabs
@@ -197,15 +219,27 @@ func retire(a config.Automation) {
 // their pane back. The run that is about to start is budgeted as a success;
 // failures keep their full allowance, erring towards the runs worth reading.
 func expired(runs []history.Record, keep, keepFailed int) []history.Record {
+	// A negative budget means never retire, for failures as much as for
+	// successes. Passing it through as a count would retire every failure
+	// instead — the exact opposite of what the setting asks for — while
+	// keep: 0 still has to retire everything, so the two cases cannot share
+	// the same negative number.
+	keepAll := map[history.Status]bool{
+		history.StatusDone:   keep < 0,
+		history.StatusFailed: keepFailed < 0,
+	}
 	budget := map[history.Status]int{
-		history.StatusDone:   keep - 1,
-		history.StatusFailed: keepFailed,
+		history.StatusDone:   max(0, keep-1),
+		history.StatusFailed: max(0, keepFailed),
 	}
 	var out []history.Record
 	for _, r := range runs {
 		left, tracked := budget[r.Status]
 		if !tracked || r.PaneID == "" {
 			continue // still running, or never got as far as a pane
+		}
+		if keepAll[r.Status] {
+			continue
 		}
 		if left > 0 {
 			budget[r.Status] = left - 1
@@ -228,6 +262,19 @@ func release(r history.Record) error {
 	}
 	if err != nil {
 		return err
+	}
+
+	// The run finished, but its agent is still a live session the user can
+	// pick up and keep talking to. Closing a working pane would kill that
+	// conversation mid-answer.
+	if r.PaneID != "" {
+		status, err := herdr.AgentStatus(r.PaneID)
+		if err != nil {
+			return err
+		}
+		if status == herdr.StatusWorking {
+			return nil
+		}
 	}
 
 	// Records written before placement was stored carry a tab only when they
@@ -283,8 +330,14 @@ func (j *journal) execute(a config.Automation) error {
 	paneID := j.rec.PaneID
 
 	if a.Workflow != "" {
-		// Delegation: herdr-workflows owns multi-step execution.
-		return herdr.PaneRun(paneID, "hwf", "run", a.Workflow)
+		// Delegation: herdr-workflows owns multi-step execution. `pane run`
+		// returns once the command is typed, so without waiting for the shell
+		// to come back the run would be called done while hwf is still going —
+		// and with keep: 0 its pane would be closed underneath it.
+		if err := herdr.PaneRun(paneID, "hwf", "run", a.Workflow); err != nil {
+			return err
+		}
+		return waitForShell(paneID, timeout)
 	}
 
 	args := a.AgentArgs
@@ -309,7 +362,38 @@ func (j *journal) execute(a config.Automation) error {
 	if err != nil {
 		return fmt.Errorf("prompt: %w", err)
 	}
+	// Settling covers idle, done *and* blocked, and a blocked agent is waiting
+	// on a question nobody is there to answer. Calling that done would retire
+	// its pane — with keep: 0, immediately — and throw the question away.
+	switch status, err := herdr.AgentStatus(paneID); {
+	case err != nil:
+		log.Printf("%s: cannot confirm the agent settled: %v", a.Name, err)
+	case status == herdr.StatusBlocked:
+		return fmt.Errorf("agent is blocked waiting for input")
+	}
 	return nil
+}
+
+// shellPoll is how often a delegated workflow's pane is checked for the shell
+// prompt coming back.
+const shellPoll = 2 * time.Second
+
+// waitForShell blocks until a pane's foreground command exits.
+func waitForShell(paneID string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		busy, err := herdr.PaneBusy(paneID)
+		if err != nil {
+			return err
+		}
+		if !busy {
+			return nil
+		}
+		if time.Now().Add(shellPoll).After(deadline) {
+			return fmt.Errorf("still running after %s", timeout)
+		}
+		time.Sleep(shellPoll)
+	}
 }
 
 // slug makes a name safe for a git branch: spaces and the characters
@@ -393,18 +477,22 @@ const capturedLines = 200
 // capture saves what the agent printed. Retirement closes the pane and throws
 // its terminal away, so without this a finished run leaves nothing but a
 // status word — and the failures are exactly the ones worth reading.
-func (j *journal) capture() {
+// It reports whether the output is safely on disk, because retiring a pane
+// whose tail was never saved destroys the only copy.
+func (j *journal) capture() bool {
 	if j.rec.PaneID == "" {
-		return
+		return false
 	}
 	text, err := herdr.PaneTail(j.rec.PaneID, capturedLines)
 	if err != nil {
 		log.Printf("%s: reading the run's output: %v", j.rec.Automation, err)
-		return
+		return false
 	}
 	if err := history.SaveOutput(j.rec.RunID, text); err != nil {
 		log.Printf("%s: saving the run's output: %v", j.rec.Automation, err)
+		return false
 	}
+	return true
 }
 
 // relabel restamps the run's pane with how it ended, so a glance at the shared

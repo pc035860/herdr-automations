@@ -100,7 +100,12 @@ func load() model {
 		m.err = err
 		return m
 	}
-	latest, _ := history.Latest()
+	latest, err := history.Latest()
+	if err != nil {
+		// Every automation would otherwise read "never", which is a claim
+		// about the automations rather than about the log.
+		m.setNotice(failStyle, "cannot read the run log: "+err.Error())
+	}
 	for _, a := range cfg.Automations {
 		r := row{auto: a}
 		if rec, ok := latest[a.Name]; ok {
@@ -349,8 +354,16 @@ func statusText(r row) string {
 		return "never"
 	}
 	// The time is the point: without it the board cannot say whether "done"
-	// happened this morning or last week.
-	return string(r.last.Status) + " " + r.last.At.Format("15:04")
+	// happened this morning or last week — which is also why anything from an
+	// earlier day shows its date instead of a clock reading that lies.
+	return string(r.last.Status) + " " + shortTime(r.last.At, time.Now())
+}
+
+func shortTime(at, now time.Time) string {
+	if at.YearDay() == now.YearDay() && at.Year() == now.Year() {
+		return at.Format("15:04")
+	}
+	return at.Format("02 Jan")
 }
 
 func statusStyle(r row) lipgloss.Style {
