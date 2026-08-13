@@ -237,6 +237,23 @@ func WorkspaceView(workspaceID string) (focused bool, activeTabID string, err er
 	return res.Workspace.Focused, res.Workspace.ActiveTabID, nil
 }
 
+// TabRename restamps a run's tab, which is how a finished run reports itself
+// in the shared workspace.
+func TabRename(tabID, label string) error {
+	if err := run(nil, "tab", "rename", tabID, label); err != nil && !gone(err) {
+		return err
+	}
+	return nil
+}
+
+// WorkspaceRename does the same for a run that has a workspace to itself.
+func WorkspaceRename(workspaceID, label string) error {
+	if err := run(nil, "workspace", "rename", workspaceID, label); err != nil && !gone(err) {
+		return err
+	}
+	return nil
+}
+
 // TabClose retires one run's tab. A tab that is already gone is a success:
 // retirement is best-effort bookkeeping, not a transaction.
 func TabClose(tabID string) error {

@@ -128,3 +128,17 @@ func TestLimiterBoundsConcurrentRuns(t *testing.T) {
 		t.Errorf("peak concurrency = %d, want the limit to actually be used", peak)
 	}
 }
+
+func TestRunLabelCarriesTimeAndOutcome(t *testing.T) {
+	start := time.Date(2026, 8, 14, 7, 3, 0, 0, time.UTC)
+	cases := map[history.Status]string{
+		history.StatusRunning: "▶ daily-graph-dream 07:03",
+		history.StatusDone:    "✓ daily-graph-dream 07:03",
+		history.StatusFailed:  "✗ daily-graph-dream 07:03",
+	}
+	for st, want := range cases {
+		if got := runLabel("daily-graph-dream", start, st); got != want {
+			t.Errorf("runLabel(%s) = %q, want %q", st, got, want)
+		}
+	}
+}

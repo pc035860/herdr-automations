@@ -75,7 +75,7 @@ func Busy() bool {
 // Run executes the automation synchronously. trigger is "cron", "catchup" or
 // "manual".
 func Run(a config.Automation, trigger string) error {
-	j := &journal{id: runID(a.Name), name: a.Name, trigger: trigger}
+	j := &journal{id: runID(a.Name), name: a.Name, trigger: trigger, start: time.Now()}
 	if _, busy := inFlight.LoadOrStore(a.Name, true); busy {
 		j.record(history.StatusSkipped, "previous run still in flight")
 		return fmt.Errorf("%s: previous run still in flight, skipped", a.Name)
@@ -90,7 +90,7 @@ func Run(a config.Automation, trigger string) error {
 	j.record(history.StatusScheduled, "")
 	retire(a)
 
-	workspaceID, tabID, paneID, err := provision(a)
+	workspaceID, tabID, paneID, err := provision(a, runLabel(a.Name, j.start, history.StatusRunning))
 	j.workspaceID, j.tabID, j.paneID = workspaceID, tabID, paneID
 	if err != nil {
 		j.record(history.StatusFailed, err.Error())
@@ -100,9 +100,11 @@ func Run(a config.Automation, trigger string) error {
 
 	if err := execute(a, j.id, paneID); err != nil {
 		j.record(history.StatusFailed, err.Error())
+		j.relabel(history.StatusFailed)
 		return err
 	}
 	j.record(history.StatusDone, "")
+	j.relabel(history.StatusDone)
 	if a.KeepCount() == 0 {
 		// Nothing here is meant to be read, so don't make the user wait until
 		// the next occurrence for the pane to go.
@@ -115,8 +117,21 @@ func Run(a config.Automation, trigger string) error {
 	return nil
 }
 
-func provision(a config.Automation) (workspaceID, tabID, paneID string, err error) {
-	label := "auto: " + a.Name
+// runLabel names a run's pane. The clock time is the load-bearing part: tabs
+// cannot be ordered through the CLI, and keep_failed leaves several runs of one
+// automation side by side, so the label is the only thing telling them apart.
+func runLabel(name string, start time.Time, st history.Status) string {
+	glyph := "▶"
+	switch st {
+	case history.StatusDone:
+		glyph = "✓"
+	case history.StatusFailed:
+		glyph = "✗"
+	}
+	return fmt.Sprintf("%s %s %s", glyph, name, start.Format("15:04"))
+}
+
+func provision(a config.Automation, label string) (workspaceID, tabID, paneID string, err error) {
 	if a.Placement == config.PlacementShared {
 		workspaceID, err = sharedWorkspace()
 		if err != nil {
@@ -325,7 +340,24 @@ func runID(name string) string {
 // every transition is logged with everything known at that point.
 type journal struct {
 	id, name, trigger          string
+	start                      time.Time
 	workspaceID, tabID, paneID string
+}
+
+// relabel restamps the run's pane with how it ended, so a glance at the shared
+// workspace tells you which runs are worth opening.
+func (j *journal) relabel(st history.Status) {
+	label := runLabel(j.name, j.start, st)
+	var err error
+	switch {
+	case j.tabID != "":
+		err = herdr.TabRename(j.tabID, label)
+	case j.workspaceID != "":
+		err = herdr.WorkspaceRename(j.workspaceID, label)
+	}
+	if err != nil {
+		log.Printf("%s: relabelling the finished run: %v", j.name, err)
+	}
 }
 
 func (j *journal) record(st history.Status, errMsg string) {
