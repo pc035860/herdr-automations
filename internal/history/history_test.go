@@ -77,9 +77,6 @@ func TestOutputSurvivesItsRunAndIsPrunedWithIt(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("HERDR_PLUGIN_STATE_DIR", dir)
 
-	if got, err := Output("never-ran"); err != nil || got != "" {
-		t.Fatalf("Output of an uncaptured run = %q, %v; want empty and no error", got, err)
-	}
 	if HasOutput("never-ran") {
 		t.Error("HasOutput true for a run that captured nothing")
 	}
@@ -90,9 +87,9 @@ func TestOutputSurvivesItsRunAndIsPrunedWithIt(t *testing.T) {
 	if !HasOutput("r1") {
 		t.Error("HasOutput false right after SaveOutput")
 	}
-	got, err := Output("r1")
-	if err != nil || got != "the agent said this\n" {
-		t.Fatalf("Output = %q, %v", got, err)
+	got, err := os.ReadFile(OutputPath("r1"))
+	if err != nil || string(got) != "the agent said this\n" {
+		t.Fatalf("captured output = %q, %v", got, err)
 	}
 
 	// Age the file past the window: pruning the log must collect it too, or

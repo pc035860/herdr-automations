@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -21,28 +23,69 @@ func bin() string {
 	return "herdr"
 }
 
-// run executes a herdr subcommand and decodes the socket-API JSON envelope
-// ({"id": ..., "result": {...}}) into out when out is non-nil.
-func run(out any, args ...string) error {
+// The error codes this package reacts to rather than merely reports.
+const (
+	codePaneBusy      = "agent_pane_busy"
+	codePromptStalled = "agent_prompt_stalled"
+	codeWorkspaceGone = "workspace_not_found"
+	codeTabGone       = "tab_not_found"
+)
+
+// APIError is herdr's structured error, kept structured. Matching on the
+// formatted message instead would misread any command whose output merely
+// quotes a code — reading back an agent's terminal, for one.
+type APIError struct {
+	Command string
+	Code    string
+	Message string
+}
+
+func (e *APIError) Error() string {
+	detail := e.Code
+	switch {
+	case e.Code == "":
+		detail = e.Message
+	case e.Message != "":
+		detail = e.Code + ": " + e.Message
+	}
+	return e.Command + ": " + detail
+}
+
+// hasCode reports whether err is an API error carrying one of codes.
+func hasCode(err error, codes ...string) bool {
+	var api *APIError
+	return errors.As(err, &api) && slices.Contains(codes, api.Code)
+}
+
+// output runs a herdr subcommand and returns its stdout. Failures come back as
+// *APIError so callers can branch on the code.
+func output(args ...string) ([]byte, error) {
 	cmd := exec.Command(bin(), args...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("%s: %s", args[0]+" "+args[1], apiError(stdout.Bytes(), stderr.String()))
+		return nil, apiError(strings.Join(args, " "), stdout.Bytes(), stderr.String())
 	}
-	if out == nil {
-		return nil
+	return stdout.Bytes(), nil
+}
+
+// run executes a herdr subcommand and decodes the socket-API JSON envelope
+// ({"id": ..., "result": {...}}) into out when out is non-nil.
+func run(out any, args ...string) error {
+	stdout, err := output(args...)
+	if err != nil || out == nil {
+		return err
 	}
 	var envelope struct {
 		Result json.RawMessage `json:"result"`
 	}
-	if err := json.Unmarshal(stdout.Bytes(), &envelope); err != nil {
-		return fmt.Errorf("herdr %v: unexpected output %q: %w", args, stdout.String(), err)
+	if err := json.Unmarshal(stdout, &envelope); err != nil {
+		return fmt.Errorf("herdr %v: unexpected output %q: %w", args, stdout, err)
 	}
 	raw := envelope.Result
 	if raw == nil {
-		raw = stdout.Bytes() // some commands print the result object bare
+		raw = stdout // some commands print the result object bare
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
 		return fmt.Errorf("herdr %v: decode result: %w", args, err)
@@ -50,47 +93,49 @@ func run(out any, args ...string) error {
 	return nil
 }
 
-// runText executes a herdr subcommand that prints plain text rather than the
-// JSON envelope — the terminal-reading commands.
-func runText(args ...string) (string, error) {
-	cmd := exec.Command(bin(), args...)
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("%s: %s", args[0]+" "+args[1], apiError(stdout.Bytes(), stderr.String()))
+// tolerant runs a command whose target may already be gone. Retirement is
+// best-effort bookkeeping, so a workspace you closed by hand is a success.
+func tolerant(args ...string) error {
+	if err := run(nil, args...); err != nil && !hasCode(err, codeWorkspaceGone, codeTabGone) {
+		return err
 	}
-	return stdout.String(), nil
+	return nil
 }
 
 // PaneTail reads back what the agent printed. Retiring a pane throws its
 // terminal away, so this is what lets a run's output outlive it.
 func PaneTail(paneID string, lines int) (string, error) {
-	return runText("pane", "read", paneID,
+	out, err := output("pane", "read", paneID,
 		"--source", "recent-unwrapped",
-		"--lines", fmt.Sprintf("%d", lines),
+		"--lines", strconv.Itoa(lines),
 		"--format", "text")
+	return string(out), err
 }
 
-// apiError turns herdr's JSON error envelope into one readable line. Without
-// this the raw payload ends up in logs and, worse, in the board's status line.
-func apiError(stdout []byte, stderr string) string {
-	var envelope struct {
-		Error struct {
-			Code    string `json:"code"`
-			Message string `json:"message"`
-		} `json:"error"`
-	}
-	if json.Unmarshal(stdout, &envelope) == nil && envelope.Error.Code != "" {
-		if envelope.Error.Message != "" {
-			return envelope.Error.Code + ": " + envelope.Error.Message
+// apiError turns herdr's JSON error envelope into a typed error. Without this
+// the raw payload ends up in logs and, worse, in the board's status line.
+func apiError(command string, stdout []byte, stderr string) error {
+	e := &APIError{Command: command}
+	// The envelope arrives on stderr for some subcommands and stdout for
+	// others, so both are tried before falling back to the raw text.
+	for _, stream := range [][]byte{stdout, []byte(stderr)} {
+		var envelope struct {
+			Error struct {
+				Code    string `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
 		}
-		return envelope.Error.Code
+		if json.Unmarshal(stream, &envelope) == nil && envelope.Error.Code != "" {
+			e.Code, e.Message = envelope.Error.Code, envelope.Error.Message
+			return e
+		}
 	}
 	if s := strings.TrimSpace(stderr); s != "" {
-		return s
+		e.Message = s
+		return e
 	}
-	return strings.TrimSpace(string(stdout))
+	e.Message = strings.TrimSpace(string(stdout))
+	return e
 }
 
 // createResult matches both worktree_created and workspace_created payloads:
@@ -101,6 +146,7 @@ type createResult struct {
 	} `json:"workspace"`
 	RootPane struct {
 		PaneID string `json:"pane_id"`
+		TabID  string `json:"tab_id"`
 	} `json:"root_pane"`
 }
 
@@ -158,12 +204,7 @@ func WorkspaceFind(label string) (string, error) {
 // root pane ids. This is what lets many automations share one workspace
 // instead of each spawning its own.
 func TabCreate(workspaceID, cwd, label string) (tabID, paneID string, err error) {
-	var res struct {
-		RootPane struct {
-			PaneID string `json:"pane_id"`
-			TabID  string `json:"tab_id"`
-		} `json:"root_pane"`
-	}
+	var res createResult
 	err = run(&res, "tab", "create",
 		"--workspace", workspaceID, "--cwd", cwd, "--label", label, "--no-focus")
 	if err != nil {
@@ -195,7 +236,7 @@ func AgentStart(name, kind, paneID string, extraArgs []string) error {
 	deadline := time.Now().Add(agentStartWait)
 	for {
 		err := run(nil, args...)
-		if err == nil || !strings.Contains(err.Error(), "agent_pane_busy") {
+		if err == nil || !hasCode(err, codePaneBusy) {
 			return err
 		}
 		if !time.Now().Add(agentStartPoll).Before(deadline) {
@@ -209,21 +250,19 @@ func AgentStart(name, kind, paneID string, extraArgs []string) error {
 // signal that its TUI has finished mounting and will accept a prompt.
 func AgentWait(target string, timeout time.Duration) error {
 	return run(nil, "agent", "wait", target,
-		"--timeout", fmt.Sprintf("%d", timeout.Milliseconds()))
+		"--timeout", strconv.FormatInt(timeout.Milliseconds(), 10))
 }
 
 // AgentPrompt submits a prompt and waits for the agent to settle (idle, done
 // or blocked), bounded by timeout.
 func AgentPrompt(target, text string, timeout time.Duration) error {
 	return run(nil, "agent", "prompt", target, text,
-		"--wait", "--timeout", fmt.Sprintf("%d", timeout.Milliseconds()))
+		"--wait", "--timeout", strconv.FormatInt(timeout.Milliseconds(), 10))
 }
 
 // PromptStalled reports whether err is herdr refusing to call a submission
 // observed: the text reached the agent's input but nothing happened.
-func PromptStalled(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "agent_prompt_stalled")
-}
+func PromptStalled(err error) bool { return hasCode(err, codePromptStalled) }
 
 // AgentSubmit presses Enter in the agent's input, then waits for it to settle.
 // Recovery for a stalled prompt: the text is already typed, so re-prompting
@@ -251,7 +290,7 @@ func WorkspaceView(workspaceID string) (focused bool, activeTabID string, err er
 		} `json:"workspace"`
 	}
 	if err := run(&res, "workspace", "get", workspaceID); err != nil {
-		if gone(err) {
+		if hasCode(err, codeWorkspaceGone) {
 			return false, "", ErrGone
 		}
 		return false, "", err
@@ -261,41 +300,19 @@ func WorkspaceView(workspaceID string) (focused bool, activeTabID string, err er
 
 // TabRename restamps a run's tab, which is how a finished run reports itself
 // in the shared workspace.
-func TabRename(tabID, label string) error {
-	if err := run(nil, "tab", "rename", tabID, label); err != nil && !gone(err) {
-		return err
-	}
-	return nil
-}
+func TabRename(tabID, label string) error { return tolerant("tab", "rename", tabID, label) }
 
 // WorkspaceRename does the same for a run that has a workspace to itself.
 func WorkspaceRename(workspaceID, label string) error {
-	if err := run(nil, "workspace", "rename", workspaceID, label); err != nil && !gone(err) {
-		return err
-	}
-	return nil
+	return tolerant("workspace", "rename", workspaceID, label)
 }
 
-// TabClose retires one run's tab. A tab that is already gone is a success:
-// retirement is best-effort bookkeeping, not a transaction.
-func TabClose(tabID string) error {
-	if err := run(nil, "tab", "close", tabID); err != nil && !gone(err) {
-		return err
-	}
-	return nil
-}
+// TabClose retires one run's tab.
+func TabClose(tabID string) error { return tolerant("tab", "close", tabID) }
 
 // WorkspaceClose retires a run that had a workspace to itself.
 func WorkspaceClose(workspaceID string) error {
-	if err := run(nil, "workspace", "close", workspaceID); err != nil && !gone(err) {
-		return err
-	}
-	return nil
-}
-
-func gone(err error) bool {
-	return err != nil && (strings.Contains(err.Error(), "workspace_not_found") ||
-		strings.Contains(err.Error(), "tab_not_found"))
+	return tolerant("workspace", "close", workspaceID)
 }
 
 // Focus brings a run's workspace to the front, then its agent pane when one
@@ -303,7 +320,7 @@ func gone(err error) bool {
 func Focus(workspaceID, paneID string) error {
 	if workspaceID != "" {
 		if err := run(nil, "workspace", "focus", workspaceID); err != nil {
-			if strings.Contains(err.Error(), "workspace_not_found") {
+			if hasCode(err, codeWorkspaceGone) {
 				return ErrGone
 			}
 			return err

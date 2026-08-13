@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -29,39 +30,28 @@ func TestExpiredKeepsTheNewestAndAllowsFailuresMore(t *testing.T) {
 
 	// keep 1: the incoming run takes the single success slot, so both earlier
 	// successes go; two failures fit inside an allowance of three.
-	if got := ids(expired(runs, 1, 3)); !equal(got, []string{"5", "3"}) {
+	if got := ids(expired(runs, 1, 3)); !slices.Equal(got, []string{"5", "3"}) {
 		t.Errorf("expired(keep 1, keepFailed 3) = %v, want [5 3]", got)
 	}
 	// keep 2: the newest success survives alongside the incoming run.
-	if got := ids(expired(runs, 2, 3)); !equal(got, []string{"3"}) {
+	if got := ids(expired(runs, 2, 3)); !slices.Equal(got, []string{"3"}) {
 		t.Errorf("expired(keep 2) = %v, want [3]", got)
 	}
 	// keepFailed 1: the older failure is retired too.
-	if got := ids(expired(runs, 1, 1)); !equal(got, []string{"5", "3", "1"}) {
+	if got := ids(expired(runs, 1, 1)); !slices.Equal(got, []string{"5", "3", "1"}) {
 		t.Errorf("expired(keepFailed 1) = %v, want [5 3 1]", got)
 	}
 	// keep 0 retires everything finished, including the newest success.
-	if got := ids(expired(runs, 0, 0)); !equal(got, []string{"5", "4", "3", "1"}) {
+	if got := ids(expired(runs, 0, 0)); !slices.Equal(got, []string{"5", "4", "3", "1"}) {
 		t.Errorf("expired(keep 0) = %v, want [5 4 3 1]", got)
 	}
 }
 
-func equal(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 func TestAgentNameIsUniquePerRunAndFitsHerdrsLimit(t *testing.T) {
 	long := "a-very-long-automation-name-that-overflows-the-limit"
-	first := agentName(long, runID(long))
-	second := agentName(long, runID(long))
+	_, firstToken := newRunID(long)
+	_, secondToken := newRunID(long)
+	first, second := agentName(long, firstToken), agentName(long, secondToken)
 
 	for _, got := range []string{first, second} {
 		if len(got) > 32 {

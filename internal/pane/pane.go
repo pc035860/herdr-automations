@@ -42,11 +42,46 @@ type model struct {
 	notice      string
 	noticeStyle lipgloss.Style
 
-	// detail holds the selected automation's past runs while the history view
-	// is open, and is nil on the board itself.
-	detail       []history.Record
-	detailOf     string
-	detailCursor int
+	// detail is non-nil exactly while the history view is open.
+	detail *detailModel
+}
+
+// detailModel is the history view's own state. It keeps the automation name
+// rather than deriving it from the board's cursor, because a config edit can
+// shrink the board's rows while the view is open.
+type detailModel struct {
+	name   string
+	runs   []detailRow
+	cursor int
+}
+
+// detailRow pairs a run with whether its output survived, resolved once when
+// the view loads rather than by stat-ing the state dir from View.
+type detailRow struct {
+	rec       history.Record
+	hasOutput bool
+}
+
+func loadDetail(name string) (*detailModel, error) {
+	runs, err := history.Runs(name, detailLimit)
+	if err != nil {
+		return nil, err
+	}
+	d := &detailModel{name: name}
+	for _, r := range runs {
+		d.runs = append(d.runs, detailRow{rec: r, hasOutput: history.HasOutput(r.RunID)})
+	}
+	return d, nil
+}
+
+// reload refreshes the listed runs, holding the cursor where it was.
+func (d *detailModel) reload() {
+	next, err := loadDetail(d.name)
+	if err != nil || len(next.runs) == 0 {
+		return
+	}
+	d.runs = next.runs
+	d.cursor = min(d.cursor, len(d.runs)-1)
 }
 
 type refreshMsg struct{}
@@ -65,9 +100,13 @@ func load() model {
 		m.err = err
 		return m
 	}
+	latest, _ := history.Latest()
 	for _, a := range cfg.Automations {
-		last, _ := history.LastRun(a.Name)
-		m.rows = append(m.rows, row{auto: a, last: last})
+		r := row{auto: a}
+		if rec, ok := latest[a.Name]; ok {
+			r.last = &rec
+		}
+		m.rows = append(m.rows, r)
 	}
 	return m
 }
@@ -93,13 +132,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.detail != nil {
 			// Keep the history view open across refreshes, and pick up runs
 			// that finished while it was.
-			if runs, err := history.Runs(m.detailOf, detailLimit); err == nil && len(runs) > 0 {
-				next.detail = runs
-			} else {
-				next.detail = m.detail
-			}
-			next.detailOf = m.detailOf
-			next.detailCursor = min(m.detailCursor, len(next.detail)-1)
+			m.detail.reload()
+			next.detail = m.detail
 		}
 		return next, tick()
 	case editedMsg:
@@ -139,17 +173,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// its output can still be reached.
 			if m.cursor < len(m.rows) {
 				name := m.rows[m.cursor].auto.Name
-				runs, err := history.Runs(name, detailLimit)
+				d, err := loadDetail(name)
 				if err != nil {
 					m.setNotice(failStyle, err.Error())
 					return m, nil
 				}
-				if len(runs) == 0 {
+				if len(d.runs) == 0 {
 					m.setNotice(dimStyle, name+" has not run yet")
 					return m, nil
 				}
-				m.detail, m.detailOf, m.detailCursor = runs, name, 0
-				m.notice = ""
+				m.detail = d
+				m.setNotice(dimStyle, "")
 			}
 		case "r":
 			if m.cursor < len(m.rows) {
@@ -194,27 +228,28 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 // updateDetail drives the history view. It owns every key while open, so the
 // board's own bindings cannot fire behind it.
 func (m model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	d := m.detail
 	switch msg.String() {
 	case "q", "esc", "h":
-		m.detail, m.detailOf = nil, ""
+		m.detail = nil
 		return m, nil
 	case "ctrl+c":
 		return m, tea.Quit
 	case "up", "k":
-		if m.detailCursor > 0 {
-			m.detailCursor--
+		if d.cursor > 0 {
+			d.cursor--
 		}
 	case "down", "j":
-		if m.detailCursor < len(m.detail)-1 {
-			m.detailCursor++
+		if d.cursor < len(d.runs)-1 {
+			d.cursor++
 		}
 	case "enter", "o":
-		r := m.detail[m.detailCursor]
-		if !history.HasOutput(r.RunID) {
+		r := d.runs[d.cursor]
+		if !r.hasOutput {
 			m.setNotice(dimStyle, "no output captured for this run")
 			return m, nil
 		}
-		cmd := pagerCommand(history.OutputPath(r.RunID))
+		cmd := pagerCommand(history.OutputPath(r.rec.RunID))
 		return m, tea.ExecProcess(cmd, func(error) tea.Msg { return refreshMsg{} })
 	}
 	return m, nil
@@ -227,13 +262,7 @@ func (m *model) setNotice(style lipgloss.Style, text string) {
 	m.noticeStyle = style
 }
 
-func (m model) noticeLine() string {
-	width := m.width
-	if width <= 0 {
-		width = 80
-	}
-	return truncate(m.notice, width-2)
-}
+func (m model) noticeLine() string { return truncate(m.notice, m.viewWidth()-2) }
 
 func (m model) View() string {
 	if m.detail != nil {
@@ -252,7 +281,7 @@ func (m model) View() string {
 		// escape codes count toward the column widths.
 		name := fmt.Sprintf("%-24s", truncate(r.auto.Name, 24))
 		cron := fmt.Sprintf("%-16s", truncate(r.auto.Cron, 16))
-		status := fmt.Sprintf("%-14s", statusText(r))
+		status := fmt.Sprintf("%-15s", statusText(r))
 		next := nextRun(r.auto)
 		if r.auto.Disabled {
 			next = "(disabled)"
@@ -281,24 +310,26 @@ func (m model) View() string {
 // detailView lists the selected automation's past runs: when each ran, how it
 // ended, and whether its output is still readable.
 func (m model) detailView() string {
-	s := titleStyle.Render(m.detailOf) +
+	s := titleStyle.Render(m.detail.name) +
 		dimStyle.Render("  enter: output · j/k: move · h/q: back") + "\n\n"
-	for i, r := range m.detail {
-		when := r.At.Format("Mon 02 Jan 15:04")
-		status := fmt.Sprintf("%-9s", r.Status)
-		note := r.Error
-		if note == "" && history.HasOutput(r.RunID) {
+	// One budget for the note, selected or not, so the text does not change
+	// length as the cursor moves over it.
+	noteWidth := max(0, m.viewWidth()-30)
+	for i, r := range m.detail.runs {
+		when := fmt.Sprintf("%-17s", r.rec.At.Format("Mon 02 Jan 15:04"))
+		status := fmt.Sprintf("%-9s", r.rec.Status)
+		note := r.rec.Error
+		if note == "" && r.hasOutput {
 			note = "output saved"
 		}
+		note = truncate(note, noteWidth)
 
-		plain := fmt.Sprintf(" %-17s %s %s", when, status, note)
-		if i == m.detailCursor {
-			s += selectedStyle.Render(truncate(plain, m.viewWidth()-1)) + "\n"
+		if i == m.detail.cursor {
+			s += selectedStyle.Render(" "+when+" "+status+" "+note) + "\n"
 			continue
 		}
-		s += " " + fmt.Sprintf("%-17s", when) + " " +
-			recordStyle(r).Render(status) + " " +
-			dimStyle.Render(truncate(note, max(0, m.viewWidth()-30))) + "\n"
+		s += " " + when + " " + recordStyle(r.rec).Render(status) + " " +
+			dimStyle.Render(note) + "\n"
 	}
 	if m.notice != "" {
 		s += "\n" + m.noticeStyle.Render(m.noticeLine()) + "\n"

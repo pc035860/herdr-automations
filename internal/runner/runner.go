@@ -4,6 +4,7 @@
 package runner
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -23,6 +24,11 @@ var inFlight sync.Map
 
 // gate bounds how many automations run at once. Its limit is set from the
 // config on every scheduler tick, so raising it releases waiters immediately.
+//
+// It is per-process, which means it bounds the daemon's scheduled runs and
+// nothing else: `herdr-automations run` and the board's `r` key each execute
+// in their own process, where the gate starts unlimited. Bounding those too
+// would mean routing manual runs through the daemon.
 var gate = &limiter{}
 
 type limiter struct {
@@ -35,6 +41,9 @@ type limiter struct {
 func SetLimit(n int) {
 	gate.mu.Lock()
 	defer gate.mu.Unlock()
+	if gate.limit == n {
+		return // the scheduler calls this every tick; don't wake waiters to re-check
+	}
 	gate.limit = n
 	if gate.wake != nil {
 		gate.wake.Broadcast()
@@ -75,30 +84,31 @@ func Busy() bool {
 // Run executes the automation synchronously. trigger is "cron", "catchup" or
 // "manual".
 func Run(a config.Automation, trigger string) error {
-	j := &journal{id: runID(a.Name), name: a.Name, trigger: trigger, start: time.Now()}
+	j := newJournal(a, trigger)
 	if _, busy := inFlight.LoadOrStore(a.Name, true); busy {
 		j.record(history.StatusSkipped, "previous run still in flight")
 		return fmt.Errorf("%s: previous run still in flight, skipped", a.Name)
 	}
 	defer inFlight.Delete(a.Name)
 
-	// Queued from here on, which Busy() already reflects: a re-exec waits for
-	// runs that have not started yet, instead of dropping them.
+	// Retirement is bookkeeping about previous runs, so it happens before the
+	// gate: holding one of only max_concurrent slots to close old panes would
+	// delay every run queued behind this one.
+	retire(a)
+
+	// Recorded before queueing. A run waiting on the gate is already committed
+	// — Busy() counts it, and without this the board would show it as idle.
+	j.record(history.StatusScheduled, "")
 	gate.acquire()
 	defer gate.release()
 
-	j.record(history.StatusScheduled, "")
-	retire(a)
-
-	workspaceID, tabID, paneID, err := provision(a, runLabel(a.Name, j.start, history.StatusRunning))
-	j.workspaceID, j.tabID, j.paneID = workspaceID, tabID, paneID
-	if err != nil {
+	if err := j.provision(a); err != nil {
 		j.record(history.StatusFailed, err.Error())
 		return err
 	}
 	j.record(history.StatusRunning, "")
 
-	if err := execute(a, j.id, paneID); err != nil {
+	if err := j.execute(a); err != nil {
 		j.capture()
 		j.record(history.StatusFailed, err.Error())
 		j.relabel(history.StatusFailed)
@@ -110,9 +120,7 @@ func Run(a config.Automation, trigger string) error {
 	if a.KeepCount() == 0 {
 		// Nothing here is meant to be read, so don't make the user wait until
 		// the next occurrence for the pane to go.
-		if err := release(history.Record{
-			WorkspaceID: j.workspaceID, TabID: j.tabID, PaneID: j.paneID,
-		}); err != nil {
+		if err := release(j.rec); err != nil {
 			log.Printf("%s: closing the finished run: %v", a.Name, err)
 		}
 	}
@@ -133,23 +141,28 @@ func runLabel(name string, start time.Time, st history.Status) string {
 	return fmt.Sprintf("%s %s %s", glyph, name, start.Format("15:04"))
 }
 
-func provision(a config.Automation, label string) (workspaceID, tabID, paneID string, err error) {
+// provision opens the pane this run will work in, recording what it claimed as
+// it goes so a failure part-way through still says what has to be cleaned up.
+func (j *journal) provision(a config.Automation) error {
+	label := j.label(history.StatusRunning)
 	if a.Placement == config.PlacementShared {
-		workspaceID, err = sharedWorkspace()
+		ws, err := sharedWorkspace()
+		j.rec.WorkspaceID = ws
 		if err != nil {
-			return "", "", "", err
+			return err
 		}
-		tabID, paneID, err = herdr.TabCreate(workspaceID, a.Repo, label)
-		return workspaceID, tabID, paneID, err
+		j.rec.TabID, j.rec.PaneID, err = herdr.TabCreate(ws, a.Repo, label)
+		return err
 	}
+	var err error
 	switch a.Workspace {
 	case config.WorkspaceWorktree:
 		branch := fmt.Sprintf("auto/%s-%s", slug(a.Name), time.Now().Format("20060102-1504"))
-		workspaceID, paneID, err = herdr.WorktreeCreate(a.Repo, branch, label)
+		j.rec.WorkspaceID, j.rec.PaneID, err = herdr.WorktreeCreate(a.Repo, branch, label)
 	case config.WorkspaceRoot:
-		workspaceID, paneID, err = herdr.WorkspaceCreate(a.Repo, label)
+		j.rec.WorkspaceID, j.rec.PaneID, err = herdr.WorkspaceCreate(a.Repo, label)
 	}
-	return workspaceID, "", paneID, err
+	return err
 }
 
 // retireScanDepth bounds how far back retirement looks. Anything older than
@@ -210,28 +223,42 @@ func release(r history.Record) error {
 		return nil
 	}
 	focused, activeTab, err := herdr.WorkspaceView(r.WorkspaceID)
-	if err == herdr.ErrGone {
+	if errors.Is(err, herdr.ErrGone) {
 		return nil // closed by hand already
 	}
 	if err != nil {
 		return err
 	}
-	if r.TabID == "" {
-		if focused {
-			return nil // the user is in it; next run gets another chance
+
+	// Records written before placement was stored carry a tab only when they
+	// were shared, so the id doubles as the discriminator for those.
+	if r.Placement == string(config.PlacementShared) || r.TabID != "" {
+		if r.TabID == "" {
+			return nil // claimed the shared workspace but never got its tab
 		}
-		return herdr.WorkspaceClose(r.WorkspaceID)
+		if focused && activeTab == r.TabID {
+			return nil
+		}
+		return herdr.TabClose(r.TabID)
 	}
-	if focused && activeTab == r.TabID {
-		return nil
+	if focused {
+		return nil // the user is in it; next run gets another chance
 	}
-	return herdr.TabClose(r.TabID)
+	return herdr.WorkspaceClose(r.WorkspaceID)
 }
+
+// sharedMu serialises find-then-create. Two automations on the same
+// occurrence would otherwise both find nothing, both create, and split their
+// tabs across two workspaces that nothing ever merges back.
+var sharedMu sync.Mutex
 
 // sharedWorkspace finds the automations workspace, creating it on first use.
 // Its own root tab is left alone: it is the anchor that keeps the workspace
 // alive once every run's tab has been retired.
 func sharedWorkspace() (string, error) {
+	sharedMu.Lock()
+	defer sharedMu.Unlock()
+
 	id, err := herdr.WorkspaceFind(config.SharedWorkspaceLabel)
 	if err != nil {
 		return "", err
@@ -251,8 +278,9 @@ func sharedWorkspace() (string, error) {
 // Generous: a cold Claude Code loading MCP servers is well past ten seconds.
 const agentReadyWait = 2 * time.Minute
 
-func execute(a config.Automation, runID, paneID string) error {
+func (j *journal) execute(a config.Automation) error {
 	timeout := time.Duration(a.TimeoutMinutes) * time.Minute
+	paneID := j.rec.PaneID
 
 	if a.Workflow != "" {
 		// Delegation: herdr-workflows owns multi-step execution.
@@ -264,7 +292,7 @@ func execute(a config.Automation, runID, paneID string) error {
 		args = append([]string{"--mcp-config", a.MCPConfig}, args...)
 	}
 	// Herdr requires agent names to be lowercase, 1-32 chars, [a-z0-9-_].
-	if err := herdr.AgentStart(agentName(a.Name, runID), a.Agent, paneID, args); err != nil {
+	if err := herdr.AgentStart(agentName(a.Name, j.token), a.Agent, paneID, args); err != nil {
 		return fmt.Errorf("start %s agent: %w", a.Agent, err)
 	}
 	// `agent start` returns while the agent's TUI is still mounting. Prompting
@@ -310,8 +338,7 @@ func slug(name string) string {
 // [a-z0-9-_], at most 32 characters. The run token is what keeps it unique —
 // once a finished run's pane is retained, its agent still holds the name, and
 // naming the next run after the automation alone collides with it.
-func agentName(automation, runID string) string {
-	token := runToken(runID)
+func agentName(automation, token string) string {
 	s := slug(automation)
 	if room := 32 - len(token) - 1; len(s) > room {
 		s = strings.Trim(s[:room], "-")
@@ -319,31 +346,44 @@ func agentName(automation, runID string) string {
 	return s + "-" + token
 }
 
-// runToken compacts a run id's nanosecond stamp into a few base-36 characters.
-func runToken(runID string) string {
-	token := runID
-	if i := strings.LastIndex(runID, "-"); i >= 0 {
-		token = runID[i+1:]
-	}
-	if n, err := strconv.ParseInt(token, 10, 64); err == nil {
-		token = strconv.FormatInt(n, 36)
-	}
+// newRunID mints a run's id and the short token its agent is named after. The
+// name is slugged because the id becomes a filename under the state dir, where
+// an automation called "reports/daily" would otherwise write outside it.
+func newRunID(name string) (id, token string) {
+	stamp := time.Now().UnixNano()
+	token = strconv.FormatInt(stamp, 36)
 	if len(token) > 6 {
 		token = token[len(token)-6:]
 	}
-	return token
+	return fmt.Sprintf("%s-%d", slug(name), stamp), token
 }
 
-func runID(name string) string {
-	return fmt.Sprintf("%s-%d", name, time.Now().UnixNano())
-}
-
-// journal accumulates a run's identifiers as provisioning discovers them, so
-// every transition is logged with everything known at that point.
+// journal accumulates a run's record as provisioning discovers it, so every
+// transition is logged with everything known at that point — and so retirement
+// can be handed the same record the log holds.
 type journal struct {
-	id, name, trigger          string
-	start                      time.Time
-	workspaceID, tabID, paneID string
+	rec   history.Record
+	token string
+	start time.Time
+}
+
+func newJournal(a config.Automation, trigger string) *journal {
+	id, token := newRunID(a.Name)
+	return &journal{
+		rec: history.Record{
+			RunID:      id,
+			Automation: a.Name,
+			Trigger:    trigger,
+			Placement:  string(a.Placement),
+		},
+		token: token,
+		start: time.Now(),
+	}
+}
+
+// label names this run's pane at a given point in its life.
+func (j *journal) label(st history.Status) string {
+	return runLabel(j.rec.Automation, j.start, st)
 }
 
 // capturedLines is how much of the agent's terminal is kept. Enough for a
@@ -354,41 +394,38 @@ const capturedLines = 200
 // its terminal away, so without this a finished run leaves nothing but a
 // status word — and the failures are exactly the ones worth reading.
 func (j *journal) capture() {
-	if j.paneID == "" {
+	if j.rec.PaneID == "" {
 		return
 	}
-	text, err := herdr.PaneTail(j.paneID, capturedLines)
+	text, err := herdr.PaneTail(j.rec.PaneID, capturedLines)
 	if err != nil {
-		log.Printf("%s: reading the run's output: %v", j.name, err)
+		log.Printf("%s: reading the run's output: %v", j.rec.Automation, err)
 		return
 	}
-	if err := history.SaveOutput(j.id, text); err != nil {
-		log.Printf("%s: saving the run's output: %v", j.name, err)
+	if err := history.SaveOutput(j.rec.RunID, text); err != nil {
+		log.Printf("%s: saving the run's output: %v", j.rec.Automation, err)
 	}
 }
 
 // relabel restamps the run's pane with how it ended, so a glance at the shared
 // workspace tells you which runs are worth opening.
 func (j *journal) relabel(st history.Status) {
-	label := runLabel(j.name, j.start, st)
+	label := j.label(st)
 	var err error
 	switch {
-	case j.tabID != "":
-		err = herdr.TabRename(j.tabID, label)
-	case j.workspaceID != "":
-		err = herdr.WorkspaceRename(j.workspaceID, label)
+	case j.rec.TabID != "":
+		err = herdr.TabRename(j.rec.TabID, label)
+	case j.rec.WorkspaceID != "":
+		err = herdr.WorkspaceRename(j.rec.WorkspaceID, label)
 	}
 	if err != nil {
-		log.Printf("%s: relabelling the finished run: %v", j.name, err)
+		log.Printf("%s: relabelling the finished run: %v", j.rec.Automation, err)
 	}
 }
 
 func (j *journal) record(st history.Status, errMsg string) {
-	err := history.Append(history.Record{
-		RunID: j.id, Automation: j.name, Trigger: j.trigger, Status: st, At: time.Now(),
-		WorkspaceID: j.workspaceID, TabID: j.tabID, PaneID: j.paneID, Error: errMsg,
-	})
-	if err != nil {
+	j.rec.Status, j.rec.At, j.rec.Error = st, time.Now(), errMsg
+	if err := history.Append(j.rec); err != nil {
 		log.Printf("history append failed: %v", err)
 	}
 }

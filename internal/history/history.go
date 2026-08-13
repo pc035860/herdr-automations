@@ -5,6 +5,7 @@ package history
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -35,17 +36,23 @@ type Record struct {
 	At          time.Time `json:"at"`
 	Trigger     string    `json:"trigger,omitempty"` // cron | manual
 	WorkspaceID string    `json:"workspace_id,omitempty"`
-	// TabID is set for shared placement, where retiring a run means closing
-	// its tab rather than the whole workspace.
-	TabID  string `json:"tab_id,omitempty"`
-	PaneID string `json:"pane_id,omitempty"`
-	Error  string `json:"error,omitempty"`
+	// Placement records whether this run owned its workspace or only a tab in
+	// the shared one. Retirement has to know: inferring it from an empty TabID
+	// would close the shared workspace — every other automation's tab with it —
+	// for a run that failed between claiming the workspace and getting a tab.
+	Placement string `json:"placement,omitempty"`
+	TabID     string `json:"tab_id,omitempty"`
+	PaneID    string `json:"pane_id,omitempty"`
+	Error     string `json:"error,omitempty"`
 }
 
 func path() string { return filepath.Join(config.StateDir(), "history.jsonl") }
 
 // mu serialises appends against the rewrite Prune does, so a run recorded
-// mid-prune is not lost to the rename.
+// mid-prune is not lost to the rename. Only within this process: Prune runs in
+// the daemon, and a record appended by the CLI or the board in the same
+// millisecond can still be dropped. Readers need no lock — an open fd survives
+// the rename.
 var mu sync.Mutex
 
 // outputDir holds one file per run: what the agent printed, captured before
@@ -65,19 +72,6 @@ func SaveOutput(runID, text string) error {
 		return err
 	}
 	return os.WriteFile(OutputPath(runID), []byte(text), 0o644)
-}
-
-// Output returns what a run printed, or "" when nothing was captured — runs
-// that never reached a pane, and every run from before this was recorded.
-func Output(runID string) (string, error) {
-	b, err := os.ReadFile(OutputPath(runID))
-	if os.IsNotExist(err) {
-		return "", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	return string(b), nil
 }
 
 // HasOutput reports whether a run left anything to read.
@@ -146,16 +140,19 @@ func pruneOutput(cutoff time.Time) error {
 	if err != nil {
 		return err
 	}
+	// One undeletable entry must not abandon the sweep — it would stall every
+	// future prune on the same file, silently.
+	var failed []error
 	for _, e := range entries {
 		info, err := e.Info()
 		if err != nil || !info.ModTime().Before(cutoff) {
 			continue
 		}
 		if err := os.Remove(filepath.Join(outputDir(), e.Name())); err != nil {
-			return err
+			failed = append(failed, err)
 		}
 	}
-	return nil
+	return errors.Join(failed...)
 }
 
 // Append writes one record; failures are returned but callers generally just
@@ -220,6 +217,25 @@ func Runs(automation string, limit int) ([]Record, error) {
 		}
 	}
 	return out, nil
+}
+
+// Latest returns the most recent record for every automation in one pass. The
+// board renders every two seconds; calling LastRun per automation instead
+// rescans the whole log once per row, which at ten hourly automations is
+// hundreds of thousands of decodes a second on the UI's own goroutine.
+func Latest() (map[string]Record, error) {
+	runs, err := Runs("", 0)
+	if err != nil {
+		return nil, err
+	}
+	latest := make(map[string]Record, len(runs))
+	for _, r := range runs {
+		// Runs is newest first, so the first sighting of a name wins.
+		if _, seen := latest[r.Automation]; !seen {
+			latest[r.Automation] = r
+		}
+	}
+	return latest, nil
 }
 
 // LastRun returns the most recent record for an automation, or nil.
