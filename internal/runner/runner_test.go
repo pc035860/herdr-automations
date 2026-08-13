@@ -3,7 +3,58 @@ package runner
 import (
 	"strings"
 	"testing"
+
+	"github.com/DnzzL/herdr-automations/internal/history"
 )
+
+func TestExpiredKeepsTheNewestAndAllowsFailuresMore(t *testing.T) {
+	// Newest first, as history.Runs returns them.
+	runs := []history.Record{
+		{RunID: "6", Status: history.StatusRunning, PaneID: "p6"},
+		{RunID: "5", Status: history.StatusDone, PaneID: "p5"},
+		{RunID: "4", Status: history.StatusFailed, PaneID: "p4"},
+		{RunID: "3", Status: history.StatusDone, PaneID: "p3"},
+		{RunID: "2", Status: history.StatusMissed}, // never got a pane
+		{RunID: "1", Status: history.StatusFailed, PaneID: "p1"},
+	}
+	ids := func(rs []history.Record) []string {
+		out := []string{}
+		for _, r := range rs {
+			out = append(out, r.RunID)
+		}
+		return out
+	}
+
+	// keep 1: the incoming run takes the single success slot, so both earlier
+	// successes go; two failures fit inside an allowance of three.
+	if got := ids(expired(runs, 1, 3)); !equal(got, []string{"5", "3"}) {
+		t.Errorf("expired(keep 1, keepFailed 3) = %v, want [5 3]", got)
+	}
+	// keep 2: the newest success survives alongside the incoming run.
+	if got := ids(expired(runs, 2, 3)); !equal(got, []string{"3"}) {
+		t.Errorf("expired(keep 2) = %v, want [3]", got)
+	}
+	// keepFailed 1: the older failure is retired too.
+	if got := ids(expired(runs, 1, 1)); !equal(got, []string{"5", "3", "1"}) {
+		t.Errorf("expired(keepFailed 1) = %v, want [5 3 1]", got)
+	}
+	// keep 0 retires everything finished, including the newest success.
+	if got := ids(expired(runs, 0, 0)); !equal(got, []string{"5", "4", "3", "1"}) {
+		t.Errorf("expired(keep 0) = %v, want [5 4 3 1]", got)
+	}
+}
+
+func equal(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
 
 func TestAgentNameIsUniquePerRunAndFitsHerdrsLimit(t *testing.T) {
 	long := "a-very-long-automation-name-that-overflows-the-limit"

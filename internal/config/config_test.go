@@ -73,6 +73,30 @@ automations:
 	}
 }
 
+func TestKeepDistinguishesUnsetFromZero(t *testing.T) {
+	withConfig(t, `
+automations:
+  - {name: default, cron: "@daily", repo: /x, prompt: p}
+  - {name: transient, cron: "@daily", repo: /x, prompt: p, keep: 0}
+  - {name: forever, cron: "@daily", repo: /x, prompt: p, keep: -1, keep_failed: 10}
+`)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a := cfg.Find("default"); a.KeepCount() != 1 || a.KeepFailedCount() != 3 || !a.Retires() {
+		t.Errorf("default: keep=%d keep_failed=%d retires=%v, want 1/3/true",
+			a.KeepCount(), a.KeepFailedCount(), a.Retires())
+	}
+	// The distinction the pointer exists for: 0 means "close it", not "unset".
+	if a := cfg.Find("transient"); a.KeepCount() != 0 || !a.Retires() {
+		t.Errorf("transient: keep=%d retires=%v, want 0/true", a.KeepCount(), a.Retires())
+	}
+	if a := cfg.Find("forever"); a.Retires() || a.KeepFailedCount() != 10 {
+		t.Errorf("forever: retires=%v keep_failed=%d, want false/10", a.Retires(), a.KeepFailedCount())
+	}
+}
+
 func TestLineOfFindsTheEntry(t *testing.T) {
 	withConfig(t, `automations:
   - name: first

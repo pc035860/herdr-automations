@@ -217,6 +217,48 @@ func AgentSubmit(target string, timeout time.Duration) error {
 // once you've reviewed and closed it, not a failure worth a stack trace.
 var ErrGone = errors.New("workspace already closed")
 
+// WorkspaceView reports whether a workspace is the one on screen and which of
+// its tabs is active there — together, whether the user is looking at a given
+// tab right now. Retiring a pane out from under them is worse than keeping one
+// pane too many.
+func WorkspaceView(workspaceID string) (focused bool, activeTabID string, err error) {
+	var res struct {
+		Workspace struct {
+			Focused     bool   `json:"focused"`
+			ActiveTabID string `json:"active_tab_id"`
+		} `json:"workspace"`
+	}
+	if err := run(&res, "workspace", "get", workspaceID); err != nil {
+		if gone(err) {
+			return false, "", ErrGone
+		}
+		return false, "", err
+	}
+	return res.Workspace.Focused, res.Workspace.ActiveTabID, nil
+}
+
+// TabClose retires one run's tab. A tab that is already gone is a success:
+// retirement is best-effort bookkeeping, not a transaction.
+func TabClose(tabID string) error {
+	if err := run(nil, "tab", "close", tabID); err != nil && !gone(err) {
+		return err
+	}
+	return nil
+}
+
+// WorkspaceClose retires a run that had a workspace to itself.
+func WorkspaceClose(workspaceID string) error {
+	if err := run(nil, "workspace", "close", workspaceID); err != nil && !gone(err) {
+		return err
+	}
+	return nil
+}
+
+func gone(err error) bool {
+	return err != nil && (strings.Contains(err.Error(), "workspace_not_found") ||
+		strings.Contains(err.Error(), "tab_not_found"))
+}
+
 // Focus brings a run's workspace to the front, then its agent pane when one
 // is known — the "jump to what this automation did" move.
 func Focus(workspaceID, paneID string) error {

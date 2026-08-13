@@ -72,9 +72,35 @@ type Automation struct {
 	// CatchUpMinutes is how late a missed occurrence may still run — the
 	// laptop-was-asleep case. 0 uses the default (120); -1 never catches up.
 	CatchUpMinutes int `yaml:"catch_up_minutes,omitempty"`
+	// Keep is how many of this automation's finished runs hold on to their
+	// pane. Unset means 1; 0 closes each run as it ends; negative never
+	// retires anything.
+	Keep *int `yaml:"keep,omitempty"`
+	// KeepFailed is the same budget for runs that failed. It defaults higher:
+	// a failure is the one run you actually want to open.
+	KeepFailed *int `yaml:"keep_failed,omitempty"`
 	// Disabled keeps the entry in the file but out of the scheduler.
 	Disabled bool `yaml:"disabled,omitempty"`
 }
+
+// KeepCount is how many finished runs keep their pane.
+func (a Automation) KeepCount() int {
+	if a.Keep == nil {
+		return 1
+	}
+	return *a.Keep
+}
+
+// KeepFailedCount is the same for failed runs.
+func (a Automation) KeepFailedCount() int {
+	if a.KeepFailed == nil {
+		return 3
+	}
+	return *a.KeepFailed
+}
+
+// Retires reports whether finished runs are ever cleaned up at all.
+func (a Automation) Retires() bool { return a.KeepCount() >= 0 }
 
 type Config struct {
 	Automations []Automation `yaml:"automations"`

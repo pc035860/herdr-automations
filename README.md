@@ -152,6 +152,9 @@ automations:
     prompt: "…"                   # OR workflow: <name>  (delegates to hwf run)
     mcp_config: ~/.config/mcp/github.json   # optional → --mcp-config
     agent_args: ["--model", "opus"]         # optional, verbatim agent flags
+    keep: 1                       # finished runs holding a pane; 0 closes on
+                                  # finish, -1 never retires
+    keep_failed: 3                # same, for runs that failed
     timeout_minutes: 60           # optional bound on the run
     catch_up_minutes: 120         # how late a sleep-delayed run may still start; -1 never
     disabled: true                # optional: keep it, don't schedule it
@@ -169,7 +172,17 @@ what didn't happen. Set `catch_up_minutes: -1` for automations that are pointles
 Timers alone don't survive sleep — macOS suspends the monotonic clock, so a job armed
 for 9am Monday can simply never fire. Hence the wall-clock loop.
 
-**What happens to the worktrees?** They accumulate as reviewable workspaces — each run is a branch you can inspect, merge, or `herdr worktree remove`. Auto-cleanup of merged runs is on the roadmap.
+**Do the panes pile up?** No — each automation keeps its last `keep` runs (default
+1) and its last `keep_failed` failures, and retires the rest. The retiring happens
+when that automation *next starts*, which is what makes one setting fit every
+schedule: a weekly automation's pane stays up for a week, an hourly one's for an
+hour, with no TTL to tune. A global "keep the last 20 runs" cannot do that — the
+hourly automations would evict the weekly one within hours. A pane you are looking
+at is never closed under you; it goes on the next round instead.
+
+**What happens to the worktrees?** Retiring a worktree run closes its workspace,
+but the branch and checkout stay: each run is still a branch you can inspect,
+merge, or `herdr worktree remove`. Auto-cleanup of merged runs is on the roadmap.
 
 **Event triggers (on push, on PR, on `worktree.created`)?** Planned — Herdr's plugin manifest already supports `[[events]]`; cron came first because it's 90% of the value.
 

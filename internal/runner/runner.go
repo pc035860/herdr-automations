@@ -39,6 +39,7 @@ func Run(a config.Automation, trigger string) error {
 	defer inFlight.Delete(a.Name)
 
 	j.record(history.StatusScheduled, "")
+	retire(a)
 
 	workspaceID, tabID, paneID, err := provision(a)
 	j.workspaceID, j.tabID, j.paneID = workspaceID, tabID, paneID
@@ -53,6 +54,15 @@ func Run(a config.Automation, trigger string) error {
 		return err
 	}
 	j.record(history.StatusDone, "")
+	if a.KeepCount() == 0 {
+		// Nothing here is meant to be read, so don't make the user wait until
+		// the next occurrence for the pane to go.
+		if err := release(history.Record{
+			WorkspaceID: j.workspaceID, TabID: j.tabID, PaneID: j.paneID,
+		}); err != nil {
+			log.Printf("%s: closing the finished run: %v", a.Name, err)
+		}
+	}
 	return nil
 }
 
@@ -74,6 +84,82 @@ func provision(a config.Automation) (workspaceID, tabID, paneID string, err erro
 		workspaceID, paneID, err = herdr.WorkspaceCreate(a.Repo, label)
 	}
 	return workspaceID, "", paneID, err
+}
+
+// retireScanDepth bounds how far back retirement looks. Anything older than
+// this has been retired already; history itself stays complete.
+const retireScanDepth = 50
+
+// retire closes the panes of this automation's earlier runs, keeping the most
+// recent few.
+//
+// It runs when a new run starts, not when one ends, and that is the whole
+// trick: a retained pane then lasts exactly one period. A weekly automation's
+// output stays up for a week and an hourly one's for an hour, from a single
+// `keep: 1` and with no TTL to tune. A global "keep the last 20 runs" cannot
+// do this — the hourly automations would evict the weekly one within hours.
+func retire(a config.Automation) {
+	if !a.Retires() {
+		return
+	}
+	runs, err := history.Runs(a.Name, retireScanDepth)
+	if err != nil {
+		log.Printf("%s: cannot read history to retire old runs: %v", a.Name, err)
+		return
+	}
+	for _, r := range expired(runs, a.KeepCount(), a.KeepFailedCount()) {
+		if err := release(r); err != nil {
+			log.Printf("%s: retiring run %s: %v", a.Name, r.RunID, err)
+		}
+	}
+}
+
+// expired picks which of an automation's past runs, newest first, have to give
+// their pane back. The run that is about to start is budgeted as a success;
+// failures keep their full allowance, erring towards the runs worth reading.
+func expired(runs []history.Record, keep, keepFailed int) []history.Record {
+	budget := map[history.Status]int{
+		history.StatusDone:   keep - 1,
+		history.StatusFailed: keepFailed,
+	}
+	var out []history.Record
+	for _, r := range runs {
+		left, tracked := budget[r.Status]
+		if !tracked || r.PaneID == "" {
+			continue // still running, or never got as far as a pane
+		}
+		if left > 0 {
+			budget[r.Status] = left - 1
+			continue
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// release closes whatever a finished run is holding — its tab under shared
+// placement, its whole workspace otherwise — unless it is on screen.
+func release(r history.Record) error {
+	if r.WorkspaceID == "" {
+		return nil
+	}
+	focused, activeTab, err := herdr.WorkspaceView(r.WorkspaceID)
+	if err == herdr.ErrGone {
+		return nil // closed by hand already
+	}
+	if err != nil {
+		return err
+	}
+	if r.TabID == "" {
+		if focused {
+			return nil // the user is in it; next run gets another chance
+		}
+		return herdr.WorkspaceClose(r.WorkspaceID)
+	}
+	if focused && activeTab == r.TabID {
+		return nil
+	}
+	return herdr.TabClose(r.TabID)
 }
 
 // sharedWorkspace finds the automations workspace, creating it on first use.
