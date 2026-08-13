@@ -111,15 +111,41 @@ func WorkspaceCreate(cwd, label string) (workspaceID, paneID string, err error) 
 	return res.ids("workspace create")
 }
 
+// A pane created moments ago is still spawning its shell, and herdr refuses to
+// start an agent in it until the prompt is up (agent_pane_busy). Profile load
+// dominates that wait, so allow for a slow ~/.zshrc rather than one poll.
+const (
+	agentStartWait = 30 * time.Second
+	agentStartPoll = 500 * time.Millisecond
+)
+
 // AgentStart launches an interactive agent in a pane sitting at a shell
 // prompt. extraArgs are forwarded to the agent executable (e.g. --mcp-config).
+// It retries while the pane is still coming up.
 func AgentStart(name, kind, paneID string, extraArgs []string) error {
 	args := []string{"agent", "start", name, "--kind", kind, "--pane", paneID}
 	if len(extraArgs) > 0 {
 		args = append(args, "--")
 		args = append(args, extraArgs...)
 	}
-	return run(nil, args...)
+	deadline := time.Now().Add(agentStartWait)
+	for {
+		err := run(nil, args...)
+		if err == nil || !strings.Contains(err.Error(), "agent_pane_busy") {
+			return err
+		}
+		if !time.Now().Add(agentStartPoll).Before(deadline) {
+			return err
+		}
+		time.Sleep(agentStartPoll)
+	}
+}
+
+// AgentWait blocks until the agent settles (idle, done or blocked) — the
+// signal that its TUI has finished mounting and will accept a prompt.
+func AgentWait(target string, timeout time.Duration) error {
+	return run(nil, "agent", "wait", target,
+		"--timeout", fmt.Sprintf("%d", timeout.Milliseconds()))
 }
 
 // AgentPrompt submits a prompt and waits for the agent to settle (idle, done
@@ -127,6 +153,22 @@ func AgentStart(name, kind, paneID string, extraArgs []string) error {
 func AgentPrompt(target, text string, timeout time.Duration) error {
 	return run(nil, "agent", "prompt", target, text,
 		"--wait", "--timeout", fmt.Sprintf("%d", timeout.Milliseconds()))
+}
+
+// PromptStalled reports whether err is herdr refusing to call a submission
+// observed: the text reached the agent's input but nothing happened.
+func PromptStalled(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "agent_prompt_stalled")
+}
+
+// AgentSubmit presses Enter in the agent's input, then waits for it to settle.
+// Recovery for a stalled prompt: the text is already typed, so re-prompting
+// would type it a second time.
+func AgentSubmit(target string, timeout time.Duration) error {
+	if err := run(nil, "agent", "send-keys", target, "Enter"); err != nil {
+		return err
+	}
+	return AgentWait(target, timeout)
 }
 
 // ErrGone means the run's workspace no longer exists — the expected outcome

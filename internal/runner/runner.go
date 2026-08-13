@@ -66,6 +66,10 @@ func provision(a config.Automation) (workspaceID, paneID string, err error) {
 	return workspaceID, paneID, err
 }
 
+// agentReadyWait bounds how long an agent may take to reach its first prompt.
+// Generous: a cold Claude Code loading MCP servers is well past ten seconds.
+const agentReadyWait = 2 * time.Minute
+
 func execute(a config.Automation, paneID string) error {
 	timeout := time.Duration(a.TimeoutMinutes) * time.Minute
 
@@ -82,7 +86,18 @@ func execute(a config.Automation, paneID string) error {
 	if err := herdr.AgentStart(agentName(a.Name), a.Agent, paneID, args); err != nil {
 		return fmt.Errorf("start %s agent: %w", a.Agent, err)
 	}
-	if err := herdr.AgentPrompt(paneID, a.Prompt, timeout); err != nil {
+	// `agent start` returns while the agent's TUI is still mounting. Prompting
+	// into that window types the text but loses the Enter, so wait for the
+	// agent to settle — and if the submission is still swallowed, press Enter
+	// on the text already sitting in the input rather than typing it twice.
+	if err := herdr.AgentWait(paneID, agentReadyWait); err != nil {
+		return fmt.Errorf("wait for %s agent: %w", a.Agent, err)
+	}
+	err := herdr.AgentPrompt(paneID, a.Prompt, timeout)
+	if herdr.PromptStalled(err) {
+		err = herdr.AgentSubmit(paneID, timeout)
+	}
+	if err != nil {
 		return fmt.Errorf("prompt: %w", err)
 	}
 	return nil
