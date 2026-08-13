@@ -81,9 +81,16 @@ func Busy() bool {
 	return busy
 }
 
-// Run executes the automation synchronously. trigger is "cron", "catchup" or
-// "manual".
+// Run executes the automation synchronously, as though it were due now.
 func Run(a config.Automation, trigger string) error {
+	return RunDue(a, trigger, time.Now())
+}
+
+// RunDue executes the automation for the occurrence due at occ. The scheduler
+// passes the occurrence rather than "now" so lateness is measured from when
+// the run was meant to happen, across both the wait for the machine to wake
+// and the wait for a concurrency slot.
+func RunDue(a config.Automation, trigger string, occ time.Time) error {
 	j := newJournal(a, trigger)
 	if _, busy := inFlight.LoadOrStore(a.Name, true); busy {
 		j.record(history.StatusSkipped, "previous run still in flight")
@@ -91,26 +98,27 @@ func Run(a config.Automation, trigger string) error {
 	}
 	defer inFlight.Delete(a.Name)
 
-	// Retirement is bookkeeping about previous runs, so it happens before the
-	// gate: holding one of only max_concurrent slots to close old panes would
-	// delay every run queued behind this one.
-	retire(a)
-
 	// Recorded before queueing. A run waiting on the gate is already committed
 	// — Busy() counts it, and without this the board would show it as idle.
 	j.record(history.StatusScheduled, "")
 	gate.acquire()
 	defer gate.release()
 
-	// The queue can be long — max_concurrent 2 against ten automations sharing
-	// an occurrence, each bounded only by timeout_minutes. The window was
-	// checked before queueing; check it again now that we know how long the
-	// wait actually was, rather than starting a run hours past its point.
-	if window := a.CatchUp(); window > 0 && time.Since(j.start) > window {
-		j.record(history.StatusMissed, fmt.Sprintf("queued %s, past the %s catch-up window",
-			time.Since(j.start).Round(time.Minute), window))
+	// The queue can be long: max_concurrent 2 against ten automations sharing
+	// an occurrence, each bounded only by timeout_minutes. The scheduler
+	// checked the window before queueing; re-check it against the occurrence
+	// now that the wait is known, rather than starting a run hours past its
+	// point.
+	if late := time.Since(occ); late > a.CatchUp() {
+		j.record(history.StatusMissed, fmt.Sprintf("%s late by the time a slot was free, "+
+			"past the %s catch-up window", late.Round(time.Minute), a.CatchUp()))
 		return fmt.Errorf("%s: queued past its catch-up window", a.Name)
 	}
+
+	// Retiring the previous panes only once this run is certain to happen: a
+	// run that turns out to be missed must not have taken away the pane its
+	// predecessor was still showing.
+	retire(a)
 
 	if err := j.provision(a); err != nil {
 		j.record(history.StatusFailed, err.Error())
@@ -250,48 +258,111 @@ func expired(runs []history.Record, keep, keepFailed int) []history.Record {
 	return out
 }
 
-// release closes whatever a finished run is holding — its tab under shared
-// placement, its whole workspace otherwise — unless it is on screen.
-func release(r history.Record) error {
-	if r.WorkspaceID == "" {
-		return nil
-	}
-	focused, activeTab, err := herdr.WorkspaceView(r.WorkspaceID)
-	if errors.Is(err, herdr.ErrGone) {
-		return nil // closed by hand already
-	}
-	if err != nil {
-		return err
-	}
+// paneState is everything observed about a run's pane before deciding to close
+// it. Gathering it into one value keeps the decision itself pure, which is what
+// makes the decision testable — and closing the wrong pane is the worst thing
+// this program can do.
+type paneState struct {
+	onScreen bool   // the user is looking at this exact pane right now
+	agent    string // herdr's agent status; "" when the pane holds no agent
+	busy     bool   // a foreground command is running
+}
 
-	// The run finished, but its agent is still a live session the user can
-	// pick up and keep talking to. Closing a working pane would kill that
-	// conversation mid-answer.
-	if r.PaneID != "" {
-		status, err := herdr.AgentStatus(r.PaneID)
-		if err != nil {
-			return err
-		}
-		if status == herdr.StatusWorking {
-			return nil
-		}
+// closeTarget names what release would close, or reports that it must not.
+type closeTarget struct {
+	tabID       string
+	workspaceID string
+}
+
+// closable decides whether a finished run's pane can be taken away, and what
+// to close. Every uncertainty answers no: an agent herdr cannot classify, a
+// pane still running something, a record that never got the tab it claimed.
+// Keeping one pane too long is a nuisance; closing a live session is not.
+func closable(r history.Record, s paneState) (closeTarget, bool) {
+	if r.WorkspaceID == "" || s.onScreen || s.busy {
+		return closeTarget{}, false
+	}
+	// Only a pane whose agent has demonstrably stopped, or which never had one,
+	// may go. "working" is obvious; "blocked" is an agent waiting on a question
+	// the user can still answer; "unknown" is herdr saying it cannot tell.
+	switch s.agent {
+	case "", herdr.StatusIdle, herdr.StatusDone:
+	default:
+		return closeTarget{}, false
 	}
 
 	// Records written before placement was stored carry a tab only when they
 	// were shared, so the id doubles as the discriminator for those.
 	if r.Placement == string(config.PlacementShared) || r.TabID != "" {
 		if r.TabID == "" {
-			return nil // claimed the shared workspace but never got its tab
+			return closeTarget{}, false // claimed the shared workspace, never got its tab
 		}
-		if focused && activeTab == r.TabID {
-			return nil
+		return closeTarget{tabID: r.TabID}, true
+	}
+	return closeTarget{workspaceID: r.WorkspaceID}, true
+}
+
+// release closes whatever a finished run is holding — its tab under shared
+// placement, its whole workspace otherwise — once nothing says it is still in
+// use. It captures the run's output first if that never happened, since
+// closing the pane destroys the only copy.
+func release(r history.Record) error {
+	if r.WorkspaceID == "" {
+		return nil
+	}
+	s, err := observe(r)
+	if errors.Is(err, herdr.ErrGone) {
+		return nil // closed by hand already
+	}
+	if err != nil {
+		return err
+	}
+	target, ok := closable(r, s)
+	if !ok {
+		return nil // next run gets another chance
+	}
+	if r.PaneID != "" && !history.HasOutput(r.RunID) {
+		text, err := herdr.PaneTail(r.PaneID, capturedLines)
+		if err != nil {
+			return err
 		}
-		return herdr.TabClose(r.TabID)
+		if err := history.SaveOutput(r.RunID, text); err != nil {
+			return err
+		}
 	}
-	if focused {
-		return nil // the user is in it; next run gets another chance
+	if target.tabID != "" {
+		return herdr.TabClose(target.tabID)
 	}
-	return herdr.WorkspaceClose(r.WorkspaceID)
+	return herdr.WorkspaceClose(target.workspaceID)
+}
+
+// observe gathers a pane's state. Focus is read last, so the window between
+// looking and closing is as short as the CLI allows.
+func observe(r history.Record) (paneState, error) {
+	var s paneState
+	if r.PaneID != "" {
+		agent, err := herdr.AgentStatus(r.PaneID)
+		if err != nil {
+			return s, err
+		}
+		s.agent = agent
+
+		// An agentless pane can still be running something — a delegated
+		// workflow, or whatever the user typed into a pane they reopened.
+		if agent == "" {
+			busy, err := herdr.PaneBusy(r.PaneID)
+			if err != nil {
+				return s, err
+			}
+			s.busy = busy
+		}
+	}
+	focused, activeTab, err := herdr.WorkspaceView(r.WorkspaceID)
+	if err != nil {
+		return s, err
+	}
+	s.onScreen = focused && (r.TabID == "" || activeTab == r.TabID)
+	return s, nil
 }
 
 // sharedMu serialises find-then-create. Two automations on the same
@@ -365,11 +436,20 @@ func (j *journal) execute(a config.Automation) error {
 	// Settling covers idle, done *and* blocked, and a blocked agent is waiting
 	// on a question nobody is there to answer. Calling that done would retire
 	// its pane — with keep: 0, immediately — and throw the question away.
-	switch status, err := herdr.AgentStatus(paneID); {
+	//
+	// Unlike the close decision, an unrecognised status is accepted here:
+	// herdr reports "unknown" for agents it cannot classify, and refusing
+	// those would fail every run of an agent kind it does not detect. Saying
+	// "done" when it isn't costs a wrong status; retention stays cautious on
+	// its own account.
+	status, err := herdr.AgentStatus(paneID)
+	switch {
 	case err != nil:
 		log.Printf("%s: cannot confirm the agent settled: %v", a.Name, err)
 	case status == herdr.StatusBlocked:
 		return fmt.Errorf("agent is blocked waiting for input")
+	case status == herdr.StatusWorking:
+		return fmt.Errorf("agent was still working when the prompt returned")
 	}
 	return nil
 }
@@ -378,15 +458,29 @@ func (j *journal) execute(a config.Automation) error {
 // prompt coming back.
 const shellPoll = 2 * time.Second
 
-// waitForShell blocks until a pane's foreground command exits.
+// startGrace is how long the shell has to pick up a submitted command before
+// an idle pane is believed.
+const startGrace = 15 * time.Second
+
+// waitForShell blocks until a pane's foreground command exits. It waits to see
+// the command running first: `pane run` only submits the line, so polling
+// immediately can catch the shell before it has started and call a workflow
+// that has not begun finished.
 func waitForShell(paneID string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
+	started := time.Now()
+	seenBusy := false
 	for {
 		busy, err := herdr.PaneBusy(paneID)
 		if err != nil {
 			return err
 		}
-		if !busy {
+		switch {
+		case busy:
+			seenBusy = true
+		case seenBusy || time.Since(started) > startGrace:
+			// Either it ran and finished, or it never started within the
+			// grace — a command that fast leaves nothing to wait for.
 			return nil
 		}
 		if time.Now().Add(shellPoll).After(deadline) {

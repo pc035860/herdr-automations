@@ -132,7 +132,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if next.cursor = m.cursor; next.cursor >= len(next.rows) {
 			next.cursor = max(0, len(next.rows)-1)
 		}
-		next.notice, next.noticeStyle = m.notice, m.noticeStyle
+		if next.notice == "" {
+			next.notice, next.noticeStyle = m.notice, m.noticeStyle
+		}
 		next.width = m.width
 		if m.detail != nil {
 			// Keep the history view open across refreshes, and pick up runs

@@ -136,11 +136,11 @@ func evaluate(state *scheduleState) {
 			trigger = "catchup"
 			log.Printf("%s: running %s late", a.Name, lateness.Round(time.Minute))
 		}
-		go func(a config.Automation, trigger string) {
-			if err := runner.Run(a, trigger); err != nil {
+		go func(a config.Automation, trigger string, occ time.Time) {
+			if err := runner.RunDue(a, trigger, occ); err != nil {
 				log.Printf("run %s: %v", a.Name, err)
 			}
-		}(a, trigger)
+		}(a, trigger, occ)
 	}
 
 	// Forget automations that are gone, so re-adding one later starts clean.

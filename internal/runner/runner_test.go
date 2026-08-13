@@ -141,3 +141,47 @@ func TestRunLabelCarriesTimeAndOutcome(t *testing.T) {
 		}
 	}
 }
+
+func TestClosableRefusesEveryUncertainty(t *testing.T) {
+	shared := history.Record{
+		RunID: "r1", WorkspaceID: "w9", TabID: "w9:t2", PaneID: "w9:p2",
+		Placement: "shared",
+	}
+	own := history.Record{RunID: "r2", WorkspaceID: "w5", PaneID: "w5:p1", Placement: "workspace"}
+	idle := paneState{agent: "idle"}
+
+	if got, ok := closable(shared, idle); !ok || got.tabID != "w9:t2" {
+		t.Errorf("settled shared run: got %+v ok=%v, want its tab closed", got, ok)
+	}
+	if got, ok := closable(own, idle); !ok || got.workspaceID != "w5" {
+		t.Errorf("settled own-workspace run: got %+v ok=%v, want its workspace closed", got, ok)
+	}
+	// A pane with no agent left is closeable; that is the ordinary case once
+	// the agent has exited.
+	if _, ok := closable(shared, paneState{}); !ok {
+		t.Error("pane with no agent was kept")
+	}
+
+	refused := map[string]paneState{
+		"on screen":          {agent: "idle", onScreen: true},
+		"agent working":      {agent: "working"},
+		"agent blocked":      {agent: "blocked"},
+		"agent unclassified": {agent: "unknown"},
+		"foreground command": {busy: true},
+	}
+	for why, s := range refused {
+		if _, ok := closable(shared, s); ok {
+			t.Errorf("%s: closed anyway", why)
+		}
+	}
+
+	// A shared run that claimed the workspace but never got its tab must never
+	// fall through to closing the workspace — that is everyone else's tabs.
+	orphan := history.Record{RunID: "r3", WorkspaceID: "w9", Placement: "shared"}
+	if got, ok := closable(orphan, idle); ok {
+		t.Errorf("shared run without a tab closed %+v", got)
+	}
+	if _, ok := closable(history.Record{RunID: "r4"}, idle); ok {
+		t.Error("record with no workspace closed something")
+	}
+}

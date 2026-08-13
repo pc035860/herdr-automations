@@ -290,6 +290,8 @@ func AgentSubmit(target string, timeout time.Duration) error {
 const (
 	StatusWorking = "working"
 	StatusBlocked = "blocked"
+	StatusIdle    = "idle"
+	StatusDone    = "done"
 )
 
 // AgentStatus reports the state of the agent in a pane, or "" when the pane
@@ -312,18 +314,23 @@ func AgentStatus(paneID string) (string, error) {
 // PaneBusy reports whether a pane is still running a foreground command rather
 // than sitting at its shell prompt. This is how a delegated workflow — which
 // is a command, not an agent — is known to be finished.
+// Both ids are nullable in herdr's schema, so absence is reported as busy: an
+// unobservable pane must not be mistaken for an idle one and closed.
 func PaneBusy(paneID string) (bool, error) {
 	var res struct {
 		ProcessInfo struct {
-			ForegroundGroup int `json:"foreground_process_group_id"`
-			ShellPID        int `json:"shell_pid"`
+			ForegroundGroup *int `json:"foreground_process_group_id"`
+			ShellPID        *int `json:"shell_pid"`
 		} `json:"process_info"`
 	}
 	if err := run(&res, "pane", "process-info", "--pane", paneID); err != nil {
-		return false, err
+		return true, err
 	}
 	info := res.ProcessInfo
-	return info.ForegroundGroup != 0 && info.ForegroundGroup != info.ShellPID, nil
+	if info.ForegroundGroup == nil || info.ShellPID == nil {
+		return true, nil
+	}
+	return *info.ForegroundGroup != *info.ShellPID, nil
 }
 
 // ErrGone means the run's workspace no longer exists — the expected outcome
