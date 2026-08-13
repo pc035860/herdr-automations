@@ -103,7 +103,24 @@ func (a Automation) KeepFailedCount() int {
 func (a Automation) Retires() bool { return a.KeepCount() >= 0 }
 
 type Config struct {
+	// MaxConcurrent bounds how many automations run at once. Ten entries
+	// sharing a 07:00 occurrence would otherwise start ten agents in the same
+	// second, each loading its own MCP servers. 0 uses the default (2);
+	// negative means no limit.
+	MaxConcurrent int `yaml:"max_concurrent,omitempty"`
+
 	Automations []Automation `yaml:"automations"`
+}
+
+// Concurrency is how many runs may be in flight at once; 0 means unlimited.
+func (c Config) Concurrency() int {
+	if c.MaxConcurrent == 0 {
+		return 2
+	}
+	if c.MaxConcurrent < 0 {
+		return 0
+	}
+	return c.MaxConcurrent
 }
 
 func (a *Automation) applyDefaults() {

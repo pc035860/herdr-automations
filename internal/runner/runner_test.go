@@ -2,7 +2,9 @@ package runner
 
 import (
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/DnzzL/herdr-automations/internal/history"
 )
@@ -88,5 +90,41 @@ func TestSlugProducesValidBranchNames(t *testing.T) {
 		if got := slug(in); got != want {
 			t.Errorf("slug(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestLimiterBoundsConcurrentRuns(t *testing.T) {
+	l := &limiter{limit: 2}
+	var mu sync.Mutex
+	active, peak := 0, 0
+
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l.acquire()
+			mu.Lock()
+			active++
+			if active > peak {
+				peak = active
+			}
+			mu.Unlock()
+
+			time.Sleep(time.Millisecond)
+
+			mu.Lock()
+			active--
+			mu.Unlock()
+			l.release()
+		}()
+	}
+	wg.Wait()
+
+	if peak > 2 {
+		t.Errorf("peak concurrency = %d, want at most 2", peak)
+	}
+	if peak < 2 {
+		t.Errorf("peak concurrency = %d, want the limit to actually be used", peak)
 	}
 }

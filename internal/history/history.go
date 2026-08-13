@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/DnzzL/herdr-automations/internal/config"
@@ -43,9 +44,59 @@ type Record struct {
 
 func path() string { return filepath.Join(config.StateDir(), "history.jsonl") }
 
+// mu serialises appends against the rewrite Prune does, so a run recorded
+// mid-prune is not lost to the rename.
+var mu sync.Mutex
+
+// Prune drops records older than maxAge. The window is deliberately generous:
+// a line of JSON costs nothing next to a pane, and history is what answers
+// "did the weekly one run at all last month" long after the panes are gone.
+func Prune(maxAge time.Duration) error {
+	mu.Lock()
+	defer mu.Unlock()
+
+	f, err := os.Open(path())
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	cutoff := time.Now().Add(-maxAge)
+	var kept []byte
+	dropped := 0
+	sc := bufio.NewScanner(f)
+	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	for sc.Scan() {
+		var r Record
+		// An unreadable line has no date to judge; keeping it is the safer bet.
+		if json.Unmarshal(sc.Bytes(), &r) == nil && r.At.Before(cutoff) {
+			dropped++
+			continue
+		}
+		kept = append(append(kept, sc.Bytes()...), '\n')
+	}
+	if err := sc.Err(); err != nil {
+		return err
+	}
+	if dropped == 0 {
+		return nil
+	}
+
+	tmp := path() + ".tmp"
+	if err := os.WriteFile(tmp, kept, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path())
+}
+
 // Append writes one record; failures are returned but callers generally just
 // log them — history must never break a run.
 func Append(r Record) error {
+	mu.Lock()
+	defer mu.Unlock()
 	if err := os.MkdirAll(config.StateDir(), 0o755); err != nil {
 		return err
 	}

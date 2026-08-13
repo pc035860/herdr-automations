@@ -21,6 +21,16 @@ import (
 // run resumes within a minute of the machine waking up.
 const tickInterval = 30 * time.Second
 
+const (
+	// historyMaxAge is how far back the run log reaches. Panes are budgeted
+	// tightly; these lines are not, because they are all that is left once a
+	// run's pane is gone.
+	historyMaxAge = 90 * 24 * time.Hour
+	// pruneInterval keeps the rewrite off the hot path — the log grows by a
+	// handful of lines per run.
+	pruneInterval = 24 * time.Hour
+)
+
 func Run() error {
 	log.SetPrefix("[herdr-automations] ")
 
@@ -38,11 +48,16 @@ func Run() error {
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 	tick := time.NewTicker(tickInterval)
 	defer tick.Stop()
+	prune := time.NewTicker(pruneInterval)
+	defer prune.Stop()
 
 	evaluate(state) // don't wait a full tick to notice what is already due
+	pruneHistory()
 
 	for {
 		select {
+		case <-prune.C:
+			pruneHistory()
 		case <-tick.C:
 			if stamp := binaryStamp(); stamp != binary && stamp != "" {
 				restart(release)
@@ -63,6 +78,8 @@ func evaluate(state *scheduleState) {
 		log.Printf("config error, leaving the schedule untouched: %v", err)
 		return
 	}
+
+	runner.SetLimit(cfg.Concurrency())
 
 	now := time.Now()
 	live := map[string]bool{}
@@ -137,6 +154,12 @@ func evaluate(state *scheduleState) {
 		if err := state.save(); err != nil {
 			log.Printf("saving schedule state: %v", err)
 		}
+	}
+}
+
+func pruneHistory() {
+	if err := history.Prune(historyMaxAge); err != nil {
+		log.Printf("pruning history: %v", err)
 	}
 }
 

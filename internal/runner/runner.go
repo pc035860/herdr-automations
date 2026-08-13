@@ -21,6 +21,50 @@ import (
 // 9:00 run is still working at 10:00, the 10:00 tick is skipped, not queued.
 var inFlight sync.Map
 
+// gate bounds how many automations run at once. Its limit is set from the
+// config on every scheduler tick, so raising it releases waiters immediately.
+var gate = &limiter{}
+
+type limiter struct {
+	mu            sync.Mutex
+	wake          *sync.Cond
+	active, limit int
+}
+
+// SetLimit changes how many runs may be in flight; 0 means unlimited.
+func SetLimit(n int) {
+	gate.mu.Lock()
+	defer gate.mu.Unlock()
+	gate.limit = n
+	if gate.wake != nil {
+		gate.wake.Broadcast()
+	}
+}
+
+// acquire blocks until a slot is free. Waiting rather than skipping is the
+// point: a run delayed by a busy minute still happens, and the catch-up
+// window is what decides when it is too late to bother.
+func (l *limiter) acquire() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.wake == nil {
+		l.wake = sync.NewCond(&l.mu)
+	}
+	for l.limit > 0 && l.active >= l.limit {
+		l.wake.Wait()
+	}
+	l.active++
+}
+
+func (l *limiter) release() {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.active--
+	if l.wake != nil {
+		l.wake.Broadcast()
+	}
+}
+
 // Busy reports whether any automation is mid-run.
 func Busy() bool {
 	busy := false
@@ -37,6 +81,11 @@ func Run(a config.Automation, trigger string) error {
 		return fmt.Errorf("%s: previous run still in flight, skipped", a.Name)
 	}
 	defer inFlight.Delete(a.Name)
+
+	// Queued from here on, which Busy() already reflects: a re-exec waits for
+	// runs that have not started yet, instead of dropping them.
+	gate.acquire()
+	defer gate.release()
 
 	j.record(history.StatusScheduled, "")
 	retire(a)

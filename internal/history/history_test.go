@@ -39,3 +39,35 @@ func TestRunsCollapsesToLatestState(t *testing.T) {
 		t.Fatalf("LastRun(triage) = %+v, %v", last, err)
 	}
 }
+
+func TestPruneDropsOnlyWhatIsPastTheWindow(t *testing.T) {
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", t.TempDir())
+	now := time.Now()
+	for _, r := range []Record{
+		{RunID: "ancient", Automation: "a", Status: StatusDone, At: now.Add(-100 * 24 * time.Hour)},
+		{RunID: "recent", Automation: "a", Status: StatusDone, At: now.Add(-2 * time.Hour)},
+	} {
+		if err := Append(r); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := Prune(90 * 24 * time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	runs, err := Runs("", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(runs) != 1 || runs[0].RunID != "recent" {
+		t.Fatalf("after prune got %+v, want only the recent run", runs)
+	}
+
+	// Nothing left to drop: the log must survive a second pass untouched.
+	if err := Prune(90 * 24 * time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if runs, _ := Runs("", 0); len(runs) != 1 {
+		t.Fatalf("second prune changed the log: %+v", runs)
+	}
+}

@@ -1,5 +1,10 @@
 # Copy to your plugin config dir (herdr plugin config-dir dnzzl.automations)
 # as automations.yaml — or let `herdr-automations add` write it for you.
+
+# How many runs may be in flight at once. Automations sharing an occurrence
+# queue instead of starting a fleet of agents in the same second.
+max_concurrent: 2
+
 automations:
   - name: issue-triage
     cron: "0 9 * * 1-5"
@@ -11,6 +16,9 @@ automations:
       draft replies for the ones needing more info.
     mcp_config: ~/.config/mcp/github.json
     timeout_minutes: 45
+    # Its tab stays up until the next weekday morning, then gets replaced.
+    keep: 1
+    keep_failed: 3
     # If the machine was asleep at 09:00, run on wake — but only within 2h.
     catch_up_minutes: 120
 

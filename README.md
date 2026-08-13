@@ -140,6 +140,9 @@ Everything goes through the `herdr` CLI — the same socket API agents themselve
 ## Full entry reference
 
 ```yaml
+max_concurrent: 2                 # runs in flight at once; -1 for no limit.
+                                  # Ten entries sharing a 07:00 occurrence
+                                  # otherwise start ten agents in one second.
 automations:
   - name: issue-triage            # unique, kebab-case
     cron: "0 9 * * 1-5"           # 5-field crontab, or @daily / @hourly / @weekly
