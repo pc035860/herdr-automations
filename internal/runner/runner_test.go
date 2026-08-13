@@ -181,6 +181,12 @@ func TestClosableRefusesEveryUncertainty(t *testing.T) {
 	if got, ok := closable(orphan, idle); ok {
 		t.Errorf("shared run without a tab closed %+v", got)
 	}
+	// Records predating the placement field look exactly like that orphan, so
+	// they get the same answer rather than a guess.
+	legacy := history.Record{RunID: "r5", WorkspaceID: "w9", PaneID: "w9:p3"}
+	if got, ok := closable(legacy, idle); ok {
+		t.Errorf("record without placement closed %+v", got)
+	}
 	if _, ok := closable(history.Record{RunID: "r4"}, idle); ok {
 		t.Error("record with no workspace closed something")
 	}

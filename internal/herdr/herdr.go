@@ -314,9 +314,21 @@ func AgentStatus(paneID string) (string, error) {
 // PaneBusy reports whether a pane is still running a foreground command rather
 // than sitting at its shell prompt. This is how a delegated workflow — which
 // is a command, not an agent — is known to be finished.
-// Both ids are nullable in herdr's schema, so absence is reported as busy: an
-// unobservable pane must not be mistaken for an idle one and closed.
-func PaneBusy(paneID string) (bool, error) {
+// Activity is what a pane is doing. Both process ids are nullable in herdr's
+// schema, so "cannot tell" is a state of its own: treating it as idle would let
+// a pane be closed out from under a running command, and treating it as
+// running would be taken as proof that a command had started.
+type Activity int
+
+const (
+	ActivityUnknown Activity = iota
+	ActivityIdle             // sitting at the shell prompt
+	ActivityRunning          // a foreground command is up
+)
+
+// PaneActivity reports whether a pane is running a foreground command. This is
+// how a delegated workflow — a command, not an agent — is known to be finished.
+func PaneActivity(paneID string) (Activity, error) {
 	var res struct {
 		ProcessInfo struct {
 			ForegroundGroup *int `json:"foreground_process_group_id"`
@@ -324,13 +336,16 @@ func PaneBusy(paneID string) (bool, error) {
 		} `json:"process_info"`
 	}
 	if err := run(&res, "pane", "process-info", "--pane", paneID); err != nil {
-		return true, err
+		return ActivityUnknown, err
 	}
 	info := res.ProcessInfo
 	if info.ForegroundGroup == nil || info.ShellPID == nil {
-		return true, nil
+		return ActivityUnknown, nil
 	}
-	return *info.ForegroundGroup != *info.ShellPID, nil
+	if *info.ForegroundGroup != *info.ShellPID {
+		return ActivityRunning, nil
+	}
+	return ActivityIdle, nil
 }
 
 // ErrGone means the run's workspace no longer exists — the expected outcome

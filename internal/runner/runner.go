@@ -81,6 +81,13 @@ func Busy() bool {
 	return busy
 }
 
+// How a run was triggered, as recorded in the history log.
+const (
+	TriggerCron    = "cron"
+	TriggerCatchUp = "catchup"
+	TriggerManual  = "manual"
+)
+
 // Run executes the automation synchronously, as though it were due now.
 func Run(a config.Automation, trigger string) error {
 	return RunDue(a, trigger, time.Now())
@@ -109,7 +116,10 @@ func RunDue(a config.Automation, trigger string, occ time.Time) error {
 	// checked the window before queueing; re-check it against the occurrence
 	// now that the wait is known, rather than starting a run hours past its
 	// point.
-	if late := time.Since(occ); late > a.CatchUp() {
+	// Manual runs are exempt: "run it now" carries no occurrence to be late
+	// for, and with catch_up_minutes: -1 the window is zero, so every one of
+	// them would be recorded missed instead of running.
+	if late := time.Since(occ); trigger != TriggerManual && late > a.CatchUp() {
 		j.record(history.StatusMissed, fmt.Sprintf("%s late by the time a slot was free, "+
 			"past the %s catch-up window", late.Round(time.Minute), a.CatchUp()))
 		return fmt.Errorf("%s: queued past its catch-up window", a.Name)
@@ -291,15 +301,20 @@ func closable(r history.Record, s paneState) (closeTarget, bool) {
 		return closeTarget{}, false
 	}
 
-	// Records written before placement was stored carry a tab only when they
-	// were shared, so the id doubles as the discriminator for those.
-	if r.Placement == string(config.PlacementShared) || r.TabID != "" {
-		if r.TabID == "" {
-			return closeTarget{}, false // claimed the shared workspace, never got its tab
-		}
+	switch {
+	case r.TabID != "":
 		return closeTarget{tabID: r.TabID}, true
+	case r.Placement == string(config.PlacementShared):
+		return closeTarget{}, false // claimed the shared workspace, never got its tab
+	case r.Placement == string(config.PlacementWorkspace):
+		return closeTarget{workspaceID: r.WorkspaceID}, true
+	default:
+		// Written before placement was recorded. A workspace id on its own
+		// cannot be told apart from a shared run that died between claiming
+		// the workspace and opening its tab — and closing that workspace takes
+		// every other automation's tab with it. Leave it; it ages out.
+		return closeTarget{}, false
 	}
-	return closeTarget{workspaceID: r.WorkspaceID}, true
 }
 
 // release closes whatever a finished run is holding — its tab under shared
@@ -309,6 +324,18 @@ func closable(r history.Record, s paneState) (closeTarget, bool) {
 func release(r history.Record) error {
 	if r.WorkspaceID == "" {
 		return nil
+	}
+	// Capture first: reading the terminal and writing it out takes long enough
+	// for the user to open the tab or the agent to pick up work, so the state
+	// the decision rests on is observed after it, not before.
+	if r.PaneID != "" && !history.HasOutput(r.RunID) {
+		text, err := herdr.PaneTail(r.PaneID, capturedLines)
+		if err != nil {
+			return err
+		}
+		if err := history.SaveOutput(r.RunID, text); err != nil {
+			return err
+		}
 	}
 	s, err := observe(r)
 	if errors.Is(err, herdr.ErrGone) {
@@ -320,15 +347,6 @@ func release(r history.Record) error {
 	target, ok := closable(r, s)
 	if !ok {
 		return nil // next run gets another chance
-	}
-	if r.PaneID != "" && !history.HasOutput(r.RunID) {
-		text, err := herdr.PaneTail(r.PaneID, capturedLines)
-		if err != nil {
-			return err
-		}
-		if err := history.SaveOutput(r.RunID, text); err != nil {
-			return err
-		}
 	}
 	if target.tabID != "" {
 		return herdr.TabClose(target.tabID)
@@ -349,12 +367,13 @@ func observe(r history.Record) (paneState, error) {
 
 		// An agentless pane can still be running something — a delegated
 		// workflow, or whatever the user typed into a pane they reopened.
+		// Anything but a confirmed idle prompt counts as in use.
 		if agent == "" {
-			busy, err := herdr.PaneBusy(r.PaneID)
+			activity, err := herdr.PaneActivity(r.PaneID)
 			if err != nil {
 				return s, err
 			}
-			s.busy = busy
+			s.busy = activity != herdr.ActivityIdle
 		}
 	}
 	focused, activeTab, err := herdr.WorkspaceView(r.WorkspaceID)
@@ -469,18 +488,19 @@ const startGrace = 15 * time.Second
 func waitForShell(paneID string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	started := time.Now()
-	seenBusy := false
+	seenRunning := false
 	for {
-		busy, err := herdr.PaneBusy(paneID)
+		activity, err := herdr.PaneActivity(paneID)
 		if err != nil {
 			return err
 		}
 		switch {
-		case busy:
-			seenBusy = true
-		case seenBusy || time.Since(started) > startGrace:
+		case activity == herdr.ActivityRunning:
+			seenRunning = true
+		case activity == herdr.ActivityIdle && (seenRunning || time.Since(started) > startGrace):
 			// Either it ran and finished, or it never started within the
-			// grace — a command that fast leaves nothing to wait for.
+			// grace — a command that fast leaves nothing to wait for. An
+			// unobservable pane is neither, so it keeps polling.
 			return nil
 		}
 		if time.Now().Add(shellPoll).After(deadline) {
