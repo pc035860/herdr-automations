@@ -50,6 +50,28 @@ func run(out any, args ...string) error {
 	return nil
 }
 
+// runText executes a herdr subcommand that prints plain text rather than the
+// JSON envelope — the terminal-reading commands.
+func runText(args ...string) (string, error) {
+	cmd := exec.Command(bin(), args...)
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("%s: %s", args[0]+" "+args[1], apiError(stdout.Bytes(), stderr.String()))
+	}
+	return stdout.String(), nil
+}
+
+// PaneTail reads back what the agent printed. Retiring a pane throws its
+// terminal away, so this is what lets a run's output outlive it.
+func PaneTail(paneID string, lines int) (string, error) {
+	return runText("pane", "read", paneID,
+		"--source", "recent-unwrapped",
+		"--lines", fmt.Sprintf("%d", lines),
+		"--format", "text")
+}
+
 // apiError turns herdr's JSON error envelope into one readable line. Without
 // this the raw payload ends up in logs and, worse, in the board's status line.
 func apiError(stdout []byte, stderr string) string {

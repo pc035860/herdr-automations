@@ -99,10 +99,12 @@ func Run(a config.Automation, trigger string) error {
 	j.record(history.StatusRunning, "")
 
 	if err := execute(a, j.id, paneID); err != nil {
+		j.capture()
 		j.record(history.StatusFailed, err.Error())
 		j.relabel(history.StatusFailed)
 		return err
 	}
+	j.capture()
 	j.record(history.StatusDone, "")
 	j.relabel(history.StatusDone)
 	if a.KeepCount() == 0 {
@@ -342,6 +344,27 @@ type journal struct {
 	id, name, trigger          string
 	start                      time.Time
 	workspaceID, tabID, paneID string
+}
+
+// capturedLines is how much of the agent's terminal is kept. Enough for a
+// summary and a stack trace; not the whole session.
+const capturedLines = 200
+
+// capture saves what the agent printed. Retirement closes the pane and throws
+// its terminal away, so without this a finished run leaves nothing but a
+// status word — and the failures are exactly the ones worth reading.
+func (j *journal) capture() {
+	if j.paneID == "" {
+		return
+	}
+	text, err := herdr.PaneTail(j.paneID, capturedLines)
+	if err != nil {
+		log.Printf("%s: reading the run's output: %v", j.name, err)
+		return
+	}
+	if err := history.SaveOutput(j.id, text); err != nil {
+		log.Printf("%s: saving the run's output: %v", j.name, err)
+	}
 }
 
 // relabel restamps the run's pane with how it ended, so a glance at the shared

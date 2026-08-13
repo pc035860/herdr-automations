@@ -30,6 +30,10 @@ type row struct {
 	last *history.Record
 }
 
+// detailLimit is how many past runs the history view lists. Enough to see a
+// pattern — the same failure three mornings running — without paging.
+const detailLimit = 10
+
 type model struct {
 	rows        []row
 	cursor      int
@@ -37,6 +41,12 @@ type model struct {
 	err         error
 	notice      string
 	noticeStyle lipgloss.Style
+
+	// detail holds the selected automation's past runs while the history view
+	// is open, and is nil on the board itself.
+	detail       []history.Record
+	detailOf     string
+	detailCursor int
 }
 
 type refreshMsg struct{}
@@ -80,6 +90,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		next.notice, next.noticeStyle = m.notice, m.noticeStyle
 		next.width = m.width
+		if m.detail != nil {
+			// Keep the history view open across refreshes, and pick up runs
+			// that finished while it was.
+			if runs, err := history.Runs(m.detailOf, detailLimit); err == nil && len(runs) > 0 {
+				next.detail = runs
+			} else {
+				next.detail = m.detail
+			}
+			next.detailOf = m.detailOf
+			next.detailCursor = min(m.detailCursor, len(next.detail)-1)
+		}
 		return next, tick()
 	case editedMsg:
 		next := load() // pick up whatever was just saved, including new entries
@@ -98,6 +119,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case tea.KeyMsg:
+		if m.detail != nil {
+			return m.updateDetail(msg)
+		}
 		switch msg.String() {
 		case "q", "esc", "ctrl+c":
 			return m, tea.Quit
@@ -108,6 +132,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "down", "j":
 			if m.cursor < len(m.rows)-1 {
 				m.cursor++
+			}
+		case "h":
+			// Past runs for this automation. The board only ever shows the
+			// latest, and once a run's pane is retired this is the only place
+			// its output can still be reached.
+			if m.cursor < len(m.rows) {
+				name := m.rows[m.cursor].auto.Name
+				runs, err := history.Runs(name, detailLimit)
+				if err != nil {
+					m.setNotice(failStyle, err.Error())
+					return m, nil
+				}
+				if len(runs) == 0 {
+					m.setNotice(dimStyle, name+" has not run yet")
+					return m, nil
+				}
+				m.detail, m.detailOf, m.detailCursor = runs, name, 0
+				m.notice = ""
 			}
 		case "r":
 			if m.cursor < len(m.rows) {
@@ -149,6 +191,35 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+// updateDetail drives the history view. It owns every key while open, so the
+// board's own bindings cannot fire behind it.
+func (m model) updateDetail(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "q", "esc", "h":
+		m.detail, m.detailOf = nil, ""
+		return m, nil
+	case "ctrl+c":
+		return m, tea.Quit
+	case "up", "k":
+		if m.detailCursor > 0 {
+			m.detailCursor--
+		}
+	case "down", "j":
+		if m.detailCursor < len(m.detail)-1 {
+			m.detailCursor++
+		}
+	case "enter", "o":
+		r := m.detail[m.detailCursor]
+		if !history.HasOutput(r.RunID) {
+			m.setNotice(dimStyle, "no output captured for this run")
+			return m, nil
+		}
+		cmd := pagerCommand(history.OutputPath(r.RunID))
+		return m, tea.ExecProcess(cmd, func(error) tea.Msg { return refreshMsg{} })
+	}
+	return m, nil
+}
+
 // setNotice stores the message as plain text; View decides how much of it
 // fits. A herdr API error is long enough to blow up the pane otherwise.
 func (m *model) setNotice(style lipgloss.Style, text string) {
@@ -165,8 +236,11 @@ func (m model) noticeLine() string {
 }
 
 func (m model) View() string {
+	if m.detail != nil {
+		return m.detailView()
+	}
 	s := titleStyle.Render("Automations") +
-		dimStyle.Render("  r: run · enter: jump to last run · e: edit config · j/k: move · q: quit") + "\n\n"
+		dimStyle.Render("  r: run · enter: jump · h: history · e: edit · j/k: move · q: quit") + "\n\n"
 	if m.err != nil {
 		return s + failStyle.Render("config error: "+m.err.Error()) + "\n"
 	}
@@ -178,7 +252,7 @@ func (m model) View() string {
 		// escape codes count toward the column widths.
 		name := fmt.Sprintf("%-24s", truncate(r.auto.Name, 24))
 		cron := fmt.Sprintf("%-16s", truncate(r.auto.Cron, 16))
-		status := fmt.Sprintf("%-8s", statusText(r))
+		status := fmt.Sprintf("%-14s", statusText(r))
 		next := nextRun(r.auto)
 		if r.auto.Disabled {
 			next = "(disabled)"
@@ -204,18 +278,59 @@ func (m model) View() string {
 	return s
 }
 
+// detailView lists the selected automation's past runs: when each ran, how it
+// ended, and whether its output is still readable.
+func (m model) detailView() string {
+	s := titleStyle.Render(m.detailOf) +
+		dimStyle.Render("  enter: output · j/k: move · h/q: back") + "\n\n"
+	for i, r := range m.detail {
+		when := r.At.Format("Mon 02 Jan 15:04")
+		status := fmt.Sprintf("%-9s", r.Status)
+		note := r.Error
+		if note == "" && history.HasOutput(r.RunID) {
+			note = "output saved"
+		}
+
+		plain := fmt.Sprintf(" %-17s %s %s", when, status, note)
+		if i == m.detailCursor {
+			s += selectedStyle.Render(truncate(plain, m.viewWidth()-1)) + "\n"
+			continue
+		}
+		s += " " + fmt.Sprintf("%-17s", when) + " " +
+			recordStyle(r).Render(status) + " " +
+			dimStyle.Render(truncate(note, max(0, m.viewWidth()-30))) + "\n"
+	}
+	if m.notice != "" {
+		s += "\n" + m.noticeStyle.Render(m.noticeLine()) + "\n"
+	}
+	return s
+}
+
+func (m model) viewWidth() int {
+	if m.width <= 0 {
+		return 80
+	}
+	return m.width
+}
+
 func statusText(r row) string {
 	if r.last == nil {
 		return "never"
 	}
-	return string(r.last.Status)
+	// The time is the point: without it the board cannot say whether "done"
+	// happened this morning or last week.
+	return string(r.last.Status) + " " + r.last.At.Format("15:04")
 }
 
 func statusStyle(r row) lipgloss.Style {
 	if r.last == nil {
 		return dimStyle
 	}
-	switch r.last.Status {
+	return recordStyle(*r.last)
+}
+
+func recordStyle(r history.Record) lipgloss.Style {
+	switch r.Status {
 	case history.StatusFailed:
 		return failStyle
 	case history.StatusDone:

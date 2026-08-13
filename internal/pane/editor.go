@@ -7,6 +7,18 @@ import (
 	"strconv"
 )
 
+// pagerCommand shows a captured run's output. A pager, not $EDITOR: this is
+// a terminal transcript to scroll, not a file to change.
+func pagerCommand(path string) *exec.Cmd {
+	if pager := os.Getenv("PAGER"); pager != "" {
+		return exec.Command(pager, path)
+	}
+	if _, err := exec.LookPath("less"); err == nil {
+		return exec.Command("less", "-R", path)
+	}
+	return exec.Command("cat", path)
+}
+
 // editorCommand opens the config file at line, using $VISUAL/$EDITOR and each
 // editor's own way of jumping to a line. Unknown editors just get the path.
 func editorCommand(path string, line int) *exec.Cmd {

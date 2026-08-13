@@ -107,6 +107,7 @@ herdr plugin pane open --plugin dnzzl.automations --entrypoint board --placement
 | Key | Does |
 |---|---|
 | `enter` | **Jump to the last run** — focuses the workspace that automation spawned, so you land right in the agent's terminal |
+| `h` | **Past runs** — when each ran, how it ended, `enter` to page through the output it left. The only way back to a run whose pane has been retired |
 | `r` | Run the selected automation now |
 | `e` | Open `automations.yaml` in `$EDITOR`, **cursor on that automation's line** |
 | `j` / `k` | Move · `q` closes |

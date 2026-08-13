@@ -48,6 +48,44 @@ func path() string { return filepath.Join(config.StateDir(), "history.jsonl") }
 // mid-prune is not lost to the rename.
 var mu sync.Mutex
 
+// outputDir holds one file per run: what the agent printed, captured before
+// its pane can be retired. It stays out of history.jsonl deliberately — the
+// log is scanned end to end on every board render, and a few hundred lines of
+// terminal per run would make that expensive.
+func outputDir() string { return filepath.Join(config.StateDir(), "output") }
+
+// OutputPath is where a run's captured output lives, for handing to a pager.
+func OutputPath(runID string) string {
+	return filepath.Join(outputDir(), runID+".log")
+}
+
+// SaveOutput stores a run's terminal output.
+func SaveOutput(runID, text string) error {
+	if err := os.MkdirAll(outputDir(), 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(OutputPath(runID), []byte(text), 0o644)
+}
+
+// Output returns what a run printed, or "" when nothing was captured — runs
+// that never reached a pane, and every run from before this was recorded.
+func Output(runID string) (string, error) {
+	b, err := os.ReadFile(OutputPath(runID))
+	if os.IsNotExist(err) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
+}
+
+// HasOutput reports whether a run left anything to read.
+func HasOutput(runID string) bool {
+	st, err := os.Stat(OutputPath(runID))
+	return err == nil && st.Size() > 0
+}
+
 // Prune drops records older than maxAge. The window is deliberately generous:
 // a line of JSON costs nothing next to a pane, and history is what answers
 // "did the weekly one run at all last month" long after the panes are gone.
@@ -55,16 +93,18 @@ func Prune(maxAge time.Duration) error {
 	mu.Lock()
 	defer mu.Unlock()
 
+	cutoff := time.Now().Add(-maxAge)
+
 	f, err := os.Open(path())
 	if os.IsNotExist(err) {
-		return nil
+		// No log to rewrite, but captured output can outlive it — a log
+		// trimmed by hand, or a state dir restored without one.
+		return pruneOutput(cutoff)
 	}
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-
-	cutoff := time.Now().Add(-maxAge)
 	var kept []byte
 	dropped := 0
 	sc := bufio.NewScanner(f)
@@ -82,14 +122,40 @@ func Prune(maxAge time.Duration) error {
 		return err
 	}
 	if dropped == 0 {
-		return nil
+		return pruneOutput(cutoff)
 	}
 
 	tmp := path() + ".tmp"
 	if err := os.WriteFile(tmp, kept, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path())
+	if err := os.Rename(tmp, path()); err != nil {
+		return err
+	}
+	return pruneOutput(cutoff)
+}
+
+// pruneOutput drops captured output past the window. It goes by file age
+// rather than by the log, so output whose record is already gone — from an
+// older window, or a hand-edited log — is collected too.
+func pruneOutput(cutoff time.Time) error {
+	entries, err := os.ReadDir(outputDir())
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		info, err := e.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if err := os.Remove(filepath.Join(outputDir(), e.Name())); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Append writes one record; failures are returned but callers generally just
