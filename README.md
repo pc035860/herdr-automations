@@ -36,6 +36,7 @@ That's the whole feature. Every weekday at 9:00, a Claude (or Codex, or opencode
 
 - **One YAML entry per automation** — no DSL, no UI required, versionable
 - **Fresh worktree per run** (branch `auto/<name>-<timestamp>`), or the repo root — your working copy is never touched
+- **One workspace for all of them** — root-mode runs land as tabs in a shared `Automations` workspace, so ten automations don't bury the workspaces you actually drive
 - **Agent-agnostic** — anything `herdr agent start` supports: `claude`, `codex`, `opencode`, `gemini`, `cursor`, …
 - **MCP attach** — `mcp_config: path.json` hands the agent its MCP servers (GitHub, Slack, your DB…)
 - **Overlap guard** — a tick that fires while the previous run is still working is *skipped*, never queued into a pile-up
@@ -144,6 +145,9 @@ automations:
     cron: "0 9 * * 1-5"           # 5-field crontab, or @daily / @hourly / @weekly
     repo: ~/Projects/myapp
     workspace: worktree           # worktree (default) | root
+    placement: shared             # shared: a tab in the "Automations" workspace
+                                  # (default for root runs) | workspace: its own
+                                  # (forced for worktree runs)
     agent: claude                 # any `herdr agent start --kind`
     prompt: "…"                   # OR workflow: <name>  (delegates to hwf run)
     mcp_config: ~/.config/mcp/github.json   # optional → --mcp-config

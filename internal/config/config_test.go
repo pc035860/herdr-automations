@@ -50,6 +50,29 @@ automations:
 	}
 }
 
+func TestPlacementDefaultsPerWorkspaceMode(t *testing.T) {
+	withConfig(t, `
+automations:
+  - {name: shared, cron: "@daily", repo: /x, prompt: p, workspace: root}
+  - {name: own, cron: "@daily", repo: /x, prompt: p, workspace: worktree}
+  - {name: opted-out, cron: "@daily", repo: /x, prompt: p, workspace: root, placement: workspace}
+`)
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[string]Placement{
+		"shared":    PlacementShared,
+		"own":       PlacementWorkspace, // a worktree brings its own workspace
+		"opted-out": PlacementWorkspace,
+	}
+	for name, w := range want {
+		if got := cfg.Find(name).Placement; got != w {
+			t.Errorf("%s: placement = %q, want %q", name, got, w)
+		}
+	}
+}
+
 func TestLineOfFindsTheEntry(t *testing.T) {
 	withConfig(t, `automations:
   - name: first
@@ -90,6 +113,12 @@ automations:
 		"bad workspace": `
 automations:
   - {name: a, cron: "@daily", repo: /x, prompt: p, workspace: sandbox}`,
+		"bad placement": `
+automations:
+  - {name: a, cron: "@daily", repo: /x, prompt: p, placement: floating}`,
+		"worktree cannot share a workspace": `
+automations:
+  - {name: a, cron: "@daily", repo: /x, prompt: p, workspace: worktree, placement: shared}`,
 	}
 	for label, yaml := range cases {
 		t.Run(label, func(t *testing.T) {

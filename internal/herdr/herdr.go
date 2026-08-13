@@ -111,6 +111,48 @@ func WorkspaceCreate(cwd, label string) (workspaceID, paneID string, err error) 
 	return res.ids("workspace create")
 }
 
+// WorkspaceFind returns the id of the workspace carrying label, or "" when
+// none does. Labels are how the shared workspace is rediscovered after a
+// daemon restart — a stored id would go stale the moment you close it.
+func WorkspaceFind(label string) (string, error) {
+	var res struct {
+		Workspaces []struct {
+			WorkspaceID string `json:"workspace_id"`
+			Label       string `json:"label"`
+		} `json:"workspaces"`
+	}
+	if err := run(&res, "workspace", "list"); err != nil {
+		return "", err
+	}
+	for _, w := range res.Workspaces {
+		if w.Label == label {
+			return w.WorkspaceID, nil
+		}
+	}
+	return "", nil
+}
+
+// TabCreate opens a tab inside an existing workspace and returns its tab and
+// root pane ids. This is what lets many automations share one workspace
+// instead of each spawning its own.
+func TabCreate(workspaceID, cwd, label string) (tabID, paneID string, err error) {
+	var res struct {
+		RootPane struct {
+			PaneID string `json:"pane_id"`
+			TabID  string `json:"tab_id"`
+		} `json:"root_pane"`
+	}
+	err = run(&res, "tab", "create",
+		"--workspace", workspaceID, "--cwd", cwd, "--label", label, "--no-focus")
+	if err != nil {
+		return "", "", err
+	}
+	if res.RootPane.TabID == "" || res.RootPane.PaneID == "" {
+		return "", "", fmt.Errorf("tab create returned no tab/pane id")
+	}
+	return res.RootPane.TabID, res.RootPane.PaneID, nil
+}
+
 // A pane created moments ago is still spawning its shell, and herdr refuses to
 // start an agent in it until the prompt is up (agent_pane_busy). Profile load
 // dominates that wait, so allow for a slow ~/.zshrc rather than one poll.

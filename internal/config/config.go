@@ -28,6 +28,22 @@ const (
 	WorkspaceRoot     Workspace = "root"     // workspace on the repo root
 )
 
+// Placement decides where a run's pane lands. Ten automations each opening a
+// workspace buries the ones you actually drive, so root-mode runs default to
+// sharing one.
+type Placement string
+
+const (
+	// PlacementShared puts the run in a tab of the shared automations
+	// workspace: ten automations, one workspace, ten tabs.
+	PlacementShared Placement = "shared"
+	// PlacementWorkspace gives the run a workspace of its own.
+	PlacementWorkspace Placement = "workspace"
+)
+
+// SharedWorkspaceLabel names the workspace shared placement collects tabs in.
+const SharedWorkspaceLabel = "Automations"
+
 // Automation is one scheduled entry: a prompt (or delegated workflow) fired
 // on a cron schedule against an agent in a provisioned workspace.
 type Automation struct {
@@ -37,6 +53,9 @@ type Automation struct {
 	Repo string `yaml:"repo"`
 	// Workspace provisioning mode; defaults to worktree.
 	Workspace Workspace `yaml:"workspace,omitempty"`
+	// Placement is where the run's pane lands: a tab in the shared workspace
+	// or one of its own. Defaults to shared, except for worktree runs.
+	Placement Placement `yaml:"placement,omitempty"`
 	// Agent kind as understood by `herdr agent start --kind`; defaults to claude.
 	Agent string `yaml:"agent,omitempty"`
 	// Prompt submitted to the agent. Mutually exclusive with Workflow.
@@ -64,6 +83,15 @@ type Config struct {
 func (a *Automation) applyDefaults() {
 	if a.Workspace == "" {
 		a.Workspace = WorkspaceWorktree
+	}
+	if a.Placement == "" {
+		// A worktree is a workspace by construction — `herdr worktree create`
+		// takes --workspace or --cwd, never both — so those keep their own and
+		// rely on retention to stay bounded.
+		a.Placement = PlacementShared
+		if a.Workspace == WorkspaceWorktree {
+			a.Placement = PlacementWorkspace
+		}
 	}
 	if a.Agent == "" {
 		a.Agent = "claude"
@@ -102,6 +130,13 @@ func (a *Automation) validate() error {
 	}
 	if a.Workspace != WorkspaceWorktree && a.Workspace != WorkspaceRoot {
 		return fmt.Errorf("%s: workspace must be worktree or root, got %q", a.Name, a.Workspace)
+	}
+	if a.Placement != PlacementShared && a.Placement != PlacementWorkspace {
+		return fmt.Errorf("%s: placement must be shared or workspace, got %q", a.Name, a.Placement)
+	}
+	if a.Workspace == WorkspaceWorktree && a.Placement == PlacementShared {
+		return fmt.Errorf("%s: worktree runs cannot share a workspace — "+
+			"herdr creates one per worktree; use placement: workspace", a.Name)
 	}
 	return nil
 }

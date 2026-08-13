@@ -34,8 +34,11 @@ type Record struct {
 	At          time.Time `json:"at"`
 	Trigger     string    `json:"trigger,omitempty"` // cron | manual
 	WorkspaceID string    `json:"workspace_id,omitempty"`
-	PaneID      string    `json:"pane_id,omitempty"`
-	Error       string    `json:"error,omitempty"`
+	// TabID is set for shared placement, where retiring a run means closing
+	// its tab rather than the whole workspace.
+	TabID  string `json:"tab_id,omitempty"`
+	PaneID string `json:"pane_id,omitempty"`
+	Error  string `json:"error,omitempty"`
 }
 
 func path() string { return filepath.Join(config.StateDir(), "history.jsonl") }
