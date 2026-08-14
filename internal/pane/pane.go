@@ -393,8 +393,8 @@ const (
 	cronCol   = 16
 	statusCol = 15
 	// scheduleCol is not padded — it ends the line — but its widest rendering
-	// is what the name column must leave room for: "next Mon 15:04 · once".
-	scheduleCol = 21
+	// is what the name column must leave room for: "in 6d 23h · once".
+	scheduleCol = 16
 )
 
 // nameWidth grows the name column into whatever the viewport has spare, so a
@@ -425,11 +425,30 @@ func scheduleText(r row) string {
 	if err != nil {
 		return ""
 	}
-	next := "next " + sched.Next(time.Now()).Format("Mon 15:04")
+	at := sched.Next(time.Now())
+	next := untilText(time.Until(at), at)
 	if r.auto.Once {
 		next += " · once"
 	}
 	return next
+}
+
+// untilText renders how far away the next run is. Relative time reads at a
+// glance while the run is near; past a week "in 32d" carries less than the
+// date itself, so it falls back to the calendar day (the cron column already
+// shows the time).
+func untilText(d time.Duration, at time.Time) string {
+	switch {
+	case d >= 7*24*time.Hour:
+		return at.Format("1/2")
+	case d >= 24*time.Hour:
+		return fmt.Sprintf("in %dd %dh", d/(24*time.Hour), d%(24*time.Hour)/time.Hour)
+	case d >= time.Hour:
+		return fmt.Sprintf("in %dh %dm", d/time.Hour, d%time.Hour/time.Minute)
+	case d >= time.Minute:
+		return fmt.Sprintf("in %dm", d/time.Minute)
+	}
+	return "in <1m"
 }
 
 // spent reports whether a one-time automation has already had its run, so the

@@ -53,9 +53,10 @@ func TestNameColumnGrowsIntoASpaciousPane(t *testing.T) {
 	if got := nameWidth(rows, 160); got != len(long) {
 		t.Errorf("nameWidth in a 160-col pane = %d, want %d", got, len(long))
 	}
-	// The pane the board was built for. It looks exactly as it always did.
-	if got := nameWidth(rows, 80); got != nameMin {
-		t.Errorf("nameWidth in an 80-col pane = %d, want %d", got, nameMin)
+	// The pane the board was built for. The narrower schedule column leaves
+	// the name room to grow past the old fixed width, but not past its need.
+	if got := nameWidth(rows, 80); got != 29 {
+		t.Errorf("nameWidth in an 80-col pane = %d, want %d", got, 29)
 	}
 	// Narrower than the board's own layout. Truncating the name is the
 	// accepted cost; shrinking below the old width is not, or the column the
@@ -109,9 +110,31 @@ func TestScheduleFieldSaysWhatTheDaemonWillActuallyDo(t *testing.T) {
 	if got := scheduleText(row{auto: off}); got != "(disabled)" {
 		t.Errorf("disabled one-time run = %q, want %q", got, "(disabled)")
 	}
-	// A plain automation is unchanged by any of this.
+	// A plain automation is unchanged by any of this. @daily is always under a
+	// day away, so it renders as relative time.
 	plain := row{auto: config.Automation{Name: "y", Cron: "@daily"}}
-	if got := scheduleText(plain); !strings.HasPrefix(got, "next ") || strings.Contains(got, "once") {
-		t.Errorf("recurring automation = %q, want a bare next-run", got)
+	if got := scheduleText(plain); !strings.HasPrefix(got, "in ") || strings.Contains(got, "once") {
+		t.Errorf("recurring automation = %q, want a bare relative next-run", got)
+	}
+}
+
+func TestUntilTextPicksAReadableGranularity(t *testing.T) {
+	at := time.Date(2026, time.August, 15, 7, 0, 0, 0, time.UTC)
+	cases := []struct {
+		d    time.Duration
+		want string
+	}{
+		{30 * time.Second, "in <1m"},
+		{45 * time.Minute, "in 45m"},
+		{18*time.Hour + 30*time.Minute, "in 18h 30m"},
+		{3*24*time.Hour + 2*time.Hour, "in 3d 2h"},
+		// A week or more out, the date says more than a day count would.
+		{7 * 24 * time.Hour, "8/15"},
+		{40 * 24 * time.Hour, "8/15"},
+	}
+	for _, c := range cases {
+		if got := untilText(c.d, at); got != c.want {
+			t.Errorf("untilText(%v) = %q, want %q", c.d, got, c.want)
+		}
 	}
 }
