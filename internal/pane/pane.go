@@ -283,16 +283,14 @@ func (m model) View() string {
 	if len(m.rows) == 0 {
 		return s + dimStyle.Render("No automations yet — run `herdr-automations add` or edit "+config.Path()) + "\n"
 	}
+	nameCol := nameWidth(m.rows, m.viewWidth())
 	for i, r := range m.rows {
 		// Pad the plain text first: styling before padding would make the
 		// escape codes count toward the column widths.
-		name := fmt.Sprintf("%-24s", truncate(r.auto.Name, 24))
-		cron := fmt.Sprintf("%-16s", truncate(r.auto.Cron, 16))
-		status := fmt.Sprintf("%-15s", statusText(r))
-		next := nextRun(r.auto)
-		if r.auto.Disabled {
-			next = "(disabled)"
-		}
+		name := fmt.Sprintf("%-*s", nameCol, truncate(r.auto.Name, nameCol))
+		cron := fmt.Sprintf("%-*s", cronCol, truncate(r.auto.Cron, cronCol))
+		status := fmt.Sprintf("%-*s", statusCol, statusText(r))
+		next := scheduleText(r)
 
 		var line string
 		switch {
@@ -386,12 +384,64 @@ func recordStyle(r history.Record) lipgloss.Style {
 	}
 }
 
-func nextRun(a config.Automation) string {
-	sched, err := config.CronParser.Parse(a.Cron)
+// Board columns. Everything but the name is sized to its widest rendering and
+// stays there; the name is the one field whose content the user chooses, and
+// the one that runs long — an automation copied from a Claude Desktop routine
+// arrives carrying the routine's name.
+const (
+	nameMin   = 24
+	cronCol   = 16
+	statusCol = 15
+	// scheduleCol is not padded — it ends the line — but its widest rendering
+	// is what the name column must leave room for: "next Mon 15:04 · once".
+	scheduleCol = 21
+)
+
+// nameWidth grows the name column into whatever the viewport has spare, so a
+// wide pane shows names in full. It never drops below the width the board
+// always had: a narrow pane should look exactly as it did before, truncation
+// and all, rather than shrinking the one column the user reads first.
+func nameWidth(rows []row, view int) int {
+	longest := 0
+	for _, r := range rows {
+		longest = max(longest, len([]rune(r.auto.Name)))
+	}
+	// One leading space, three gaps between the four columns, and the columns
+	// whose width is fixed.
+	spare := view - (1 + 3 + cronCol + statusCol + scheduleCol)
+	return min(max(longest, nameMin), max(nameMin, spare))
+}
+
+// scheduleText is the row's rightmost field: when this automation runs next,
+// or why it doesn't.
+func scheduleText(r row) string {
+	switch {
+	case r.auto.Disabled:
+		return "(disabled)"
+	case r.auto.Once && spent(r):
+		return "(once · done)"
+	}
+	sched, err := config.CronParser.Parse(r.auto.Cron)
 	if err != nil {
 		return ""
 	}
-	return "next " + sched.Next(time.Now()).Format("Mon 15:04")
+	next := "next " + sched.Next(time.Now()).Format("Mon 15:04")
+	if r.auto.Once {
+		next += " · once"
+	}
+	return next
+}
+
+// spent reports whether a one-time automation has already had its run, so the
+// board stops advertising a next occurrence the daemon will never fire.
+//
+// The daemon's own answer lives in its schedule state; this reads the last run
+// instead, which agrees with it in every case the daemon can produce — once it
+// retires an automation there are no further runs to change the answer. A
+// manual `run` after the fact is the one way they diverge, and it diverges
+// toward the truth: that run really did happen.
+func spent(r row) bool {
+	return r.last != nil && r.last.Status == history.StatusDone
 }
 
 func truncate(s string, n int) string {
