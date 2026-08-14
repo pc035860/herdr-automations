@@ -153,3 +153,41 @@ automations:
 		})
 	}
 }
+
+func TestEnvExportsAreSortedAndQuoted(t *testing.T) {
+	a := Automation{Env: map[string]string{
+		"MCP_TIMEOUT": "60000",
+		"GREETING":    "hello world",
+		"AWKWARD":     "it's fine; rm -rf /",
+	}}
+	got := a.EnvExports()
+	want := []string{
+		`export AWKWARD='it'\''s fine; rm -rf /'`,
+		`export GREETING='hello world'`,
+		`export MCP_TIMEOUT='60000'`,
+	}
+	if len(got) != len(want) {
+		t.Fatalf("got %d exports, want %d: %q", len(got), len(want), got)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("export %d:\n got %s\nwant %s", i, got[i], want[i])
+		}
+	}
+	if len(Automation{}.EnvExports()) != 0 {
+		t.Error("an automation without env produced exports")
+	}
+}
+
+func TestEnvNamesAShellCannotExportAreRejected(t *testing.T) {
+	for _, name := range []string{"2FAST", "HAS-DASH", "HAS SPACE", "", "A=B"} {
+		a := Automation{
+			Name: "probe", Cron: "@daily", Repo: "/tmp", Prompt: "hi",
+			Workspace: WorkspaceRoot, Placement: PlacementShared,
+			Env: map[string]string{name: "v"},
+		}
+		if err := a.validate(); err == nil {
+			t.Errorf("accepted env name %q", name)
+		}
+	}
+}

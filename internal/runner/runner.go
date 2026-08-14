@@ -434,6 +434,13 @@ func (j *journal) execute(a config.Automation) error {
 	if a.MCPConfig != "" {
 		args = append([]string{"--mcp-config", a.MCPConfig}, args...)
 	}
+	// Exported into the shell rather than passed to `agent start`, which takes
+	// no environment: the agent inherits it from the pane it launches in.
+	for _, line := range a.EnvExports() {
+		if err := herdr.PaneRun(paneID, line); err != nil {
+			return fmt.Errorf("set environment: %w", err)
+		}
+	}
 	// Herdr requires agent names to be lowercase, 1-32 chars, [a-z0-9-_].
 	if err := herdr.AgentStart(agentName(a.Name, j.token), a.Agent, paneID, args); err != nil {
 		return fmt.Errorf("start %s agent: %w", a.Agent, err)

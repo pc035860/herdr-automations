@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -67,6 +69,10 @@ type Automation struct {
 	MCPConfig string `yaml:"mcp_config,omitempty"`
 	// AgentArgs are extra args appended to the agent command verbatim.
 	AgentArgs []string `yaml:"agent_args,omitempty"`
+	// Env is exported into the pane's shell before the agent starts, for the
+	// knobs an agent only reads from the environment — MCP_TIMEOUT for a Claude
+	// Code whose MCP servers are slow to come up. Scoped to this automation.
+	Env map[string]string `yaml:"env,omitempty"`
 	// TimeoutMinutes bounds the agent prompt --wait; defaults to 60.
 	TimeoutMinutes int `yaml:"timeout_minutes,omitempty"`
 	// CatchUpMinutes is how late a missed occurrence may still run — the
@@ -81,6 +87,28 @@ type Automation struct {
 	KeepFailed *int `yaml:"keep_failed,omitempty"`
 	// Disabled keeps the entry in the file but out of the scheduler.
 	Disabled bool `yaml:"disabled,omitempty"`
+}
+
+// envName is what a shell will accept on the left of an export. Values are
+// quoted rather than restricted, but a malformed name cannot be rescued.
+var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
+
+// EnvExports renders Env as shell export lines, sorted so a given config
+// always produces the same commands. Values are single-quoted — an embedded
+// quote is closed, escaped and reopened — so a value carrying spaces or shell
+// metacharacters reaches the agent as it was written.
+func (a Automation) EnvExports() []string {
+	names := make([]string, 0, len(a.Env))
+	for k := range a.Env {
+		names = append(names, k)
+	}
+	sort.Strings(names)
+	lines := make([]string, 0, len(names))
+	for _, k := range names {
+		v := strings.ReplaceAll(a.Env[k], "'", `'\''`)
+		lines = append(lines, fmt.Sprintf("export %s='%s'", k, v))
+	}
+	return lines
 }
 
 // KeepCount is how many finished runs keep their pane.
@@ -176,6 +204,12 @@ func (a *Automation) validate() error {
 	}
 	if a.Placement != PlacementShared && a.Placement != PlacementWorkspace {
 		return fmt.Errorf("%s: placement must be shared or workspace, got %q", a.Name, a.Placement)
+	}
+	for k := range a.Env {
+		if !envName.MatchString(k) {
+			return fmt.Errorf("%s: invalid env name %q: letters, digits and "+
+				"underscore only, not starting with a digit", a.Name, k)
+		}
 	}
 	if a.Workspace == WorkspaceWorktree && a.Placement == PlacementShared {
 		return fmt.Errorf("%s: worktree runs cannot share a workspace — "+
