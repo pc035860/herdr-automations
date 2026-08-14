@@ -38,6 +38,11 @@ func due(sched cron.Schedule, last, now time.Time) (occ time.Time, skipped int, 
 // for, so restarts and sleeps don't replay or lose runs.
 type scheduleState struct {
 	LastOccurrence map[string]time.Time `json:"last_occurrence"`
+	// Completed is when a `once` automation was seen to have finished. It is
+	// kept here rather than read from the run log every time because the log
+	// is pruned by age: a one-time run from last quarter must not come back
+	// to life once the record of it is gone.
+	Completed map[string]time.Time `json:"completed,omitempty"`
 }
 
 func statePath() string {
@@ -52,6 +57,10 @@ func loadState() *scheduleState {
 	}
 	if json.Unmarshal(raw, s) != nil || s.LastOccurrence == nil {
 		s.LastOccurrence = map[string]time.Time{}
+	}
+	// Absent from every state file written before `once` existed.
+	if s.Completed == nil {
+		s.Completed = map[string]time.Time{}
 	}
 	return s
 }

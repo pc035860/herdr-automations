@@ -27,3 +27,17 @@ automations:
     repo: ~/Projects/myapp
     workflow: bump-dependencies   # delegated to herdr-workflows: hwf run bump-dependencies
     disabled: true
+
+  # Runs at 03:00 on 20 August and then retires itself — no edit needed after.
+  # A failed attempt doesn't count, so with this cron the retry is next year:
+  # use @daily if you would rather it try again tomorrow.
+  - name: one-off-migration
+    cron: "0 3 20 8 *"
+    once: true
+    repo: ~/Projects/myapp
+    workspace: root
+    prompt: Run the data migration in docs/migrations/2026-08-batch.md.
+    env:
+      # Exported into the pane's shell before the agent starts.
+      MCP_TIMEOUT: "60000"
+    timeout_minutes: 90

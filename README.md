@@ -156,12 +156,16 @@ automations:
     prompt: "…"                   # OR workflow: <name>  (delegates to hwf run)
     mcp_config: ~/.config/mcp/github.json   # optional → --mcp-config
     agent_args: ["--model", "opus"]         # optional, verbatim agent flags
+    env:                          # optional: exported into the pane's shell
+      MCP_TIMEOUT: "60000"        # before the agent starts, for the knobs it
+                                  # only reads from the environment
     keep: 1                       # finished runs holding a pane; 0 closes on
                                   # finish, -1 never retires
     keep_failed: 3                # same, for runs that failed
     timeout_minutes: 60           # optional bound on the run
     catch_up_minutes: 120         # how late a sleep-delayed run may still start; -1 never
     disabled: true                # optional: keep it, don't schedule it
+    once: true                    # optional: retire it once a run finishes
 ```
 
 ## FAQ
@@ -187,6 +191,14 @@ at is never closed under you; it goes on the next round instead.
 **What happens to the worktrees?** Retiring a worktree run closes its workspace,
 but the branch and checkout stay: each run is still a branch you can inspect,
 merge, or `herdr worktree remove`. Auto-cleanup of merged runs is on the roadmap.
+
+**Can I schedule something to run just once?** Add `once: true` and give it a cron
+saying when to try. The automation retires itself after a run *finishes* — the
+schedule state remembers it, so the file needs no edit afterwards and the entry can
+sit there as a record of what was done. A run that fails doesn't spend it: `once`
+means the work has to happen, not that the moment has to be spent, so the next
+occurrence still gets a turn. Pick the cron with that in mind — `0 3 20 8 *` retries
+next year, `@daily` retries tomorrow.
 
 **Event triggers (on push, on PR, on `worktree.created`)?** Planned — Herdr's plugin manifest already supports `[[events]]`; cron came first because it's 90% of the value.
 

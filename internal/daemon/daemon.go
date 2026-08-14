@@ -90,6 +90,27 @@ func evaluate(state *scheduleState) {
 		if a.Disabled {
 			continue
 		}
+		if a.Once {
+			if _, spent := state.Completed[a.Name]; spent {
+				continue
+			}
+			// The run happens on another goroutine, so its outcome is read
+			// back here on a later tick rather than written from there: every
+			// write to the schedule state stays on this one.
+			runs, err := history.Runs(a.Name, onceScanDepth)
+			if err != nil {
+				// Fail closed. Repeating a one-time run repeats whatever it
+				// did; waiting for a readable log costs only the delay.
+				log.Printf("%s: cannot tell whether its one-time run happened: %v", a.Name, err)
+				continue
+			}
+			if usedUp(runs) {
+				state.Completed[a.Name] = now
+				dirty = true
+				log.Printf("%s: one-time run finished, retiring it from the schedule", a.Name)
+				continue
+			}
+		}
 		sched, err := config.CronParser.Parse(a.Cron)
 		if err != nil {
 			log.Printf("%s: %v", a.Name, err) // Load validated it; be defensive
@@ -150,11 +171,35 @@ func evaluate(state *scheduleState) {
 			dirty = true
 		}
 	}
+	for name := range state.Completed {
+		if !live[name] {
+			delete(state.Completed, name)
+			dirty = true
+		}
+	}
 	if dirty {
 		if err := state.save(); err != nil {
 			log.Printf("saving schedule state: %v", err)
 		}
 	}
+}
+
+// onceScanDepth bounds how far back the run log is read when deciding whether
+// a one-time automation is spent. It only has to span the attempts made since
+// the entry was added, and the answer is remembered once found.
+const onceScanDepth = 20
+
+// usedUp reports whether a one-time automation has had the run it was added
+// for. A failed or missed attempt does not count: `once` says the work has to
+// happen, not that the moment has to be spent, so the next occurrence should
+// still get its turn.
+func usedUp(runs []history.Record) bool {
+	for _, r := range runs {
+		if r.Status == history.StatusDone {
+			return true
+		}
+	}
+	return false
 }
 
 func pruneHistory() {

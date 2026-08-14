@@ -87,6 +87,11 @@ type Automation struct {
 	KeepFailed *int `yaml:"keep_failed,omitempty"`
 	// Disabled keeps the entry in the file but out of the scheduler.
 	Disabled bool `yaml:"disabled,omitempty"`
+	// Once retires the automation from the schedule after one run finishes,
+	// without editing this file. Cron still says when to try: pick a date far
+	// enough out that a failed attempt gets no unwanted second chance, since a
+	// run that fails is not counted and the next occurrence will try again.
+	Once bool `yaml:"once,omitempty"`
 }
 
 // envName is what a shell will accept on the left of an export. Values are

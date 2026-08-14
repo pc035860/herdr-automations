@@ -1,10 +1,13 @@
 package daemon
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/DnzzL/herdr-automations/internal/config"
+	"github.com/DnzzL/herdr-automations/internal/history"
 )
 
 func at(t *testing.T, s string) time.Time {
@@ -67,4 +70,47 @@ func TestCatchUpWindowDefaults(t *testing.T) {
 	if got := a.CatchUp(); got != 2*time.Hour {
 		t.Fatalf("CatchUp() = %s, want 2h", got)
 	}
+}
+
+func TestOnceIsSpentOnlyByARunThatFinished(t *testing.T) {
+	// A one-time automation exists to get work done. Attempts that failed or
+	// never started leave it owed, so the next occurrence still gets a turn.
+	unfinished := []history.Record{
+		{Status: history.StatusFailed},
+		{Status: history.StatusMissed},
+		{Status: history.StatusSkipped},
+		{Status: history.StatusScheduled},
+		{Status: history.StatusRunning},
+	}
+	if usedUp(unfinished) {
+		t.Error("retired a one-time automation that never completed a run")
+	}
+	if usedUp(nil) {
+		t.Error("retired a one-time automation that never ran at all")
+	}
+	// Newest first, as history.Runs returns them: a failed retry after the
+	// run that succeeded must not bring the automation back.
+	retried := []history.Record{
+		{Status: history.StatusFailed},
+		{Status: history.StatusDone},
+	}
+	if !usedUp(retried) {
+		t.Error("a finished one-time run did not retire the automation")
+	}
+}
+
+func TestStateFilesWrittenBeforeOnceStillLoad(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("HERDR_PLUGIN_STATE_DIR", dir)
+	old := `{"last_occurrence":{"nightly":"2026-08-14T07:00:00+08:00"}}`
+	if err := os.WriteFile(filepath.Join(dir, "schedule.json"), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := loadState()
+	if len(s.LastOccurrence) != 1 {
+		t.Fatalf("lost the existing schedule: %+v", s.LastOccurrence)
+	}
+	// Writing to a nil map panics, and evaluate() writes here the first time
+	// a one-time automation finishes.
+	s.Completed["nightly"] = time.Now()
 }
