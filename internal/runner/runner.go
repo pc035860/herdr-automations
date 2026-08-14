@@ -494,27 +494,57 @@ const promptAcceptWait = 15 * time.Second
 // idle while its TUI is still mounting, and typing into that window loses the
 // text outright, not just the Enter that follows it.
 func submit(paneID, prompt string, timeout time.Duration) error {
-	err := herdr.AgentPrompt(paneID, prompt, timeout)
-	if !herdr.PromptStalled(err) {
-		return err // accepted, or failed for a reason worth reporting
-	}
+	return submitWith(promptOps{
+		prompt:  func() error { return herdr.AgentPrompt(paneID, prompt, timeout) },
+		enter:   func() error { return herdr.AgentSubmit(paneID) },
+		working: func() error { return herdr.AgentWorking(paneID, promptAcceptWait) },
+		settle:  func() error { return herdr.AgentWait(paneID, timeout) },
+	}, time.Now, promptRetryWindow)
+}
 
-	// The text may be sitting in the input with only its Enter swallowed, so
-	// press Enter before considering typing it again.
-	if err := herdr.AgentSubmit(paneID); err != nil {
-		return err
-	}
-	if err := herdr.AgentWorking(paneID, promptAcceptWait); err == nil {
-		return herdr.AgentWait(paneID, timeout)
-	}
+// promptOps are the herdr calls submit drives, named for what they mean to the
+// submission rather than the subcommand behind them. Injected so the retry
+// loop can be exercised without a live agent.
+type promptOps struct {
+	prompt  func() error // type the prompt, then wait for the agent to settle
+	enter   func() error // press Enter on text already in the input
+	working func() error // wait for visible evidence the agent took it
+	settle  func() error // wait out the work the agent accepted
+}
 
-	// Nothing started, so the text never landed either and the input is empty:
-	// safe to type it, and necessary — otherwise this run reports success
-	// having done nothing.
-	if err := herdr.AgentPrompt(paneID, prompt, timeout); err != nil {
-		return fmt.Errorf("the agent never accepted it: %w", err)
+// promptRetryWindow bounds how long submit keeps re-offering a prompt the
+// agent will not take. One retry is not enough: herdr calls an agent idle once
+// its process is up, but a Claude Code still connecting MCP servers has no
+// input to type into yet, and that gap is as long as the servers take to
+// answer. A run on 2026-08-14 spent 35 seconds there — every MCP server timing
+// out at once — and giving up inside that window recorded a failure for a run
+// that went on to do the work.
+const promptRetryWindow = 2 * time.Minute
+
+func submitWith(ops promptOps, now func() time.Time, window time.Duration) error {
+	deadline := now().Add(window)
+	for {
+		err := ops.prompt()
+		if !herdr.PromptStalled(err) {
+			return err // accepted, or failed for a reason worth reporting
+		}
+
+		// The text may be sitting in the input with only its Enter swallowed,
+		// so press Enter before considering typing it again.
+		if err := ops.enter(); err != nil {
+			return err
+		}
+		if ops.working() == nil {
+			return ops.settle()
+		}
+
+		// Nothing started, so the text never landed either and the input is
+		// empty: safe to type it again, and necessary — otherwise this run
+		// reports success having done nothing.
+		if !now().Before(deadline) {
+			return fmt.Errorf("the agent never accepted it: %w", err)
+		}
 	}
-	return nil
 }
 
 // startGrace is how long the shell has to pick up a submitted command before
