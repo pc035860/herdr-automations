@@ -149,7 +149,7 @@ automations:
     cron: "0 9 * * 1-5"           # 5-field crontab, or @daily / @hourly / @weekly
     repo: ~/Projects/myapp
     workspace: worktree           # worktree (default) | root
-    placement: shared             # shared: a tab in the "Automations" workspace
+    placement: shared             # shared: a tab in the "◷" workspace
                                   # (default for root runs) | workspace: its own
                                   # (forced for worktree runs)
     agent: claude                 # any `herdr agent start --kind`

@@ -89,7 +89,7 @@ for a week and an hourly one's for an hour, from the same `keep: 1`.
 - `keep_failed: 3` (default) — failures are kept longer; a failure is the run
   the user actually wants to open
 
-`placement: shared` collects every run as a tab in one "Automations" workspace,
+`placement: shared` collects every run as a tab in one "◷" workspace,
 which is what keeps ten automations from burying the workspaces the user drives.
 Worktree runs default to their own workspace; root runs default to shared.
 

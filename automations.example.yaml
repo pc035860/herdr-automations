@@ -36,7 +36,7 @@ automations:
     once: true
     repo: ~/Projects/myapp
     workspace: root
-    # Root runs share one "Automations" workspace by default, so ten of them
+    # Root runs share one "◷" workspace by default, so ten of them
     # don't bury the workspaces you actually drive. Say `workspace` here to
     # give this run one of its own instead.
     placement: shared

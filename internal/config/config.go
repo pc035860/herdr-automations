@@ -44,7 +44,14 @@ const (
 )
 
 // SharedWorkspaceLabel names the workspace shared placement collects tabs in.
-const SharedWorkspaceLabel = "Automations"
+//
+// It is a glyph rather than a word because the navigator prefixes every row
+// with it: spelled out, the same eleven characters repeated down the sidebar
+// pushed the part that differs — the time and the automation's name — off the
+// end. A clock face carries the whole of what the prefix has to say. It is
+// deliberately not the alarm-clock emoji, which terminals render two cells wide
+// and in colour.
+const SharedWorkspaceLabel = "◷"
 
 // Automation is one scheduled entry: a prompt (or delegated workflow) fired
 // on a cron schedule against an agent in a provisioned workspace.
