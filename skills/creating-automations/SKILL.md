@@ -21,6 +21,15 @@ herdr plugin config-dir dnzzl.automations    # → <dir>/automations.yaml
 
 Fallback when Herdr isn't installed: `~/.config/herdr-automations/automations.yaml`.
 
+**Check whether that path is a symlink** (`ls -l`, or `readlink -f`). Nothing
+under `~/.config` is version-controlled, so a user who cares about this file
+will often have made it a link into a repo. Edit through the link as normal —
+the daemon reads with `os.ReadFile` and follows it — but once the change is
+verified, the edit is only half-saved: `git -C <target repo> add`, commit with
+a message naming the automation, and push. Leaving it uncommitted puts the repo
+one machine failure away from losing the schedule, and leaves anyone reading
+that repo with a stale copy.
+
 ## Entry format
 
 ```yaml
@@ -70,6 +79,13 @@ Exactly one of `prompt` / `workflow` is required.
   (default 120), otherwise they appear as `missed` in the history.
 - `workspace: worktree` means the agent never touches the user's working copy.
   Only choose `root` when the task must see uncommitted local state.
+- **Put the prompt in the entry, not behind a path.** A prompt of the form
+  "Read <file> and do what it says" makes the automation depend on a file the
+  daemon never validates: it can be moved or deleted and the entry still loads
+  clean, failing only at 7am. Multi-line prompts are fine — use YAML `prompt: |`.
+  The exception is genuinely long instructions that are themselves worth keeping
+  and versioning (an audit checklist, a report spec); reference those by path
+  and keep them beside the yaml.
 - Set `env: MCP_TIMEOUT: "60000"` on every entry whose agent loads MCP servers,
   which in practice is all of them — servers connect during agent startup no
   matter whether the prompt goes on to call an MCP tool, and the 30s default
