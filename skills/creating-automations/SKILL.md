@@ -6,9 +6,10 @@ description: Schedule a recurring agent task with herdr-automations (cron + prom
 # Scheduling Herdr automations
 
 An automation is a cron schedule plus a prompt. At the scheduled time the
-daemon spawns the agent in a fresh git worktree of a repo and submits the
-prompt. Your job: translate the user's intent into a valid YAML entry, write
-it, and tell them when it will next run.
+daemon provisions a workspace on a repo — a fresh git worktree by default, or
+the repo root — spawns the agent there and submits the prompt. Your job:
+translate the user's intent into a valid YAML entry, write it, and tell them
+when it will next run.
 
 ## Where the file lives
 
@@ -23,19 +24,28 @@ Fallback when Herdr isn't installed: `~/.config/herdr-automations/automations.ya
 ## Entry format
 
 ```yaml
+max_concurrent: 2                 # optional, top-level: runs in flight at once.
+                                  # Default 2; ten entries sharing 07:00 would
+                                  # otherwise start ten agents in one second.
 automations:
   - name: issue-triage            # unique
     cron: "0 9 * * 1-5"           # 5-field crontab, or @daily / @hourly / @weekly
     repo: ~/Projects/myapp        # repo the agent works in
     workspace: worktree           # worktree (default, fresh branch per run) | root
+    placement: shared             # shared (default for root) | workspace
     agent: claude                 # any kind `herdr agent start` supports
     prompt: |
       Triage new GitHub issues: label them, close duplicates,
       draft replies for the ones needing more info.
     mcp_config: ~/.config/mcp/github.json   # optional → passed as --mcp-config
     agent_args: ["--model", "opus"]         # optional, verbatim agent flags
+    env:                          # optional, exported into the pane's shell
+      MCP_TIMEOUT: "60000"        # before the agent starts
     timeout_minutes: 60           # optional, default 60
     catch_up_minutes: 120         # optional: how late a sleep-delayed run may start; -1 never
+    keep: 1                       # optional: finished runs that keep their pane
+    keep_failed: 3                # optional: same budget for failures
+    # once: true                  # retire the automation after one run finishes
     # disabled: true              # keep the entry, stop scheduling it
 ```
 
@@ -60,6 +70,28 @@ Exactly one of `prompt` / `workflow` is required.
   (default 120), otherwise they appear as `missed` in the history.
 - `workspace: worktree` means the agent never touches the user's working copy.
   Only choose `root` when the task must see uncommitted local state.
+- Set `env: MCP_TIMEOUT: "60000"` on every entry whose agent loads MCP servers,
+  which in practice is all of them — servers connect during agent startup no
+  matter whether the prompt goes on to call an MCP tool, and the 30s default
+  makes a slow morning look like `agent_prompt_stalled` rather than an MCP
+  error. Don't try to work out which entries "use MCP".
+
+## Panes and tabs
+
+Each run opens its own pane; `keep` decides how long the finished one stays.
+Old panes are retired **when the next run starts**, not when a run ends, so a
+retained pane lasts exactly one period — a weekly automation's output stays up
+for a week and an hourly one's for an hour, from the same `keep: 1`.
+
+- `keep: 1` (default) — one finished run on screen at a time
+- `keep: 0` — close the pane the moment the run ends
+- `keep: -1` — never retire; for output meant to be read days later
+- `keep_failed: 3` (default) — failures are kept longer; a failure is the run
+  the user actually wants to open
+
+`placement: shared` collects every run as a tab in one "Automations" workspace,
+which is what keeps ten automations from burying the workspaces the user drives.
+Worktree runs default to their own workspace; root runs default to shared.
 
 ## Choosing the schedule
 

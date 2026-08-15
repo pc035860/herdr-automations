@@ -18,6 +18,7 @@ scripts/smoke.sh                                        # smoke test
 - `once: true` 的語意是「工作要完成」不是「時刻要用掉」：failed run 不 spend，下一個 occurrence 會重試；board 的 `spent()` 以最後一筆 `StatusDone` 判斷。
 - shared placement 的 run 若沒拿到 tab，它記的 workspace 是**大家共用的那個**——改名或關掉會波及所有 automation。`closable` / `relabelRun` 都對此 fail-closed，只認明確的 `PlacementWorkspace`；`Placement` 為空的舊記錄一律不碰。
 - 任何「隨時間才變 stale」的顯示（例如過夜 run 的 label 要補日期）必須由 daemon 時鐘驅動，不要掛在 run 或 retire 上——`keep: -1` 與 `once:` 的 automation 不會再進 retire，正好是最需要補的那些。掃描對象問 `herdr.LiveTargets()`，不要用 history 的固定筆數窗口。
+- **動到 `config.Automation` 的欄位就要同步 `skills/creating-automations/SKILL.md` 與 `automations.example.yaml`**：兩份都沒有測試護著，schema 加欄位時很容易只改 struct。SKILL.md 是 agent 唯一讀得到的格式來源（`internal/skill` 把它 symlink 進 `~/.claude/skills`），它漏掉的欄位等於 agent 不知道存在——2026-08-15 就發現 `env` / `once` / `keep` / `keep_failed` / `placement` 五個全漏了。
 
 ## Structure
 

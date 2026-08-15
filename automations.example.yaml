@@ -36,6 +36,10 @@ automations:
     once: true
     repo: ~/Projects/myapp
     workspace: root
+    # Root runs share one "Automations" workspace by default, so ten of them
+    # don't bury the workspaces you actually drive. Say `workspace` here to
+    # give this run one of its own instead.
+    placement: shared
     prompt: Run the data migration in docs/migrations/2026-08-batch.md.
     env:
       # Exported into the pane's shell before the agent starts.
