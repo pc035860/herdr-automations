@@ -8,9 +8,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/DnzzL/herdr-automations/internal/config"
@@ -170,7 +172,10 @@ func (j *journal) retireNow(keep int, saved bool) {
 // runLabel names a run's pane. The clock time is the load-bearing part: tabs
 // cannot be ordered through the CLI, and keep_failed leaves several runs of one
 // automation side by side, so the label is the only thing telling them apart.
-func runLabel(name string, start time.Time, st history.Status) string {
+// It comes before the name so that a column of tabs lines its times up, which
+// is how a morning's runs are read — the rare dated one breaks the column, and
+// that row is the one worth stopping at anyway.
+func runLabel(name string, start, now time.Time, st history.Status) string {
 	glyph := "▶"
 	switch st {
 	case history.StatusDone:
@@ -178,7 +183,24 @@ func runLabel(name string, start time.Time, st history.Status) string {
 	case history.StatusFailed:
 		glyph = "✗"
 	}
-	return fmt.Sprintf("%s %s %s", glyph, name, start.Format("15:04"))
+	return fmt.Sprintf("%s %s %s", glyph, runStamp(start, now), name)
+}
+
+// runStamp dates a run that is not from today. A kept failure is unambiguous on
+// the day it ran and ambiguous the next morning, when the same automation puts
+// an identically labelled tab beside it — same name, same clock time, only the
+// glyph differing. Today's runs stay short: most of the board is today.
+func runStamp(start, now time.Time) string {
+	if sameDay(start, now) {
+		return start.Format("15:04")
+	}
+	return start.Format("1/2 15:04")
+}
+
+func sameDay(a, b time.Time) bool {
+	ay, am, ad := a.Date()
+	by, bm, bd := b.Date()
+	return ay == by && am == bm && ad == bd
 }
 
 // provision opens the pane this run will work in, recording what it claimed as
@@ -231,6 +253,137 @@ func retire(a config.Automation) {
 			log.Printf("%s: retiring run %s: %v", a.Name, r.RunID, err)
 		}
 	}
+}
+
+// RestampStale dates the labels of runs that have outlived the day they ran on.
+//
+// A run cannot do this for itself: when its label is written it has no way of
+// knowing it will still be on screen tomorrow, and dating every label would put
+// a date on the whole board for the sake of the few that are kept. Nor can the
+// next run do it — the automations most likely to leave a pane up for days are
+// the ones that retire nothing (keep: -1) or never run again (once: true), so
+// hanging this off a run would miss precisely the cases it exists for. It is
+// driven by the clock instead, from the daemon; once a day is enough.
+//
+// Which runs still matter comes from herdr rather than from a window over the
+// log. History remembers runs whose panes closed months ago, and any fixed
+// depth is both too deep — thousands of renames at targets that no longer exist
+// — and too shallow, since a busy automation can push a kept pane out of it.
+// Failing to reach herdr means relabelling nothing: a stale label is a far
+// smaller problem than renaming something on a guess.
+func RestampStale(now time.Time) bool { return restamp(now, false) }
+
+// RestampOrphans does the same at daemon startup, and also dates the runs whose
+// records stop at "running" without ever having said how they ended. A cron run
+// is executed by the daemon itself and cannot outlive it, so at startup one of
+// those is finished no matter what its record says, and nothing else will ever
+// relabel it. That reasoning does not extend to a manual run — the board and
+// the CLI run those in their own process, which happily survives a daemon
+// restart — nor to a record too old to say which it was, so those are left
+// alone: dating a run that is genuinely in flight would race its own final
+// label and could put ▶ back over a ✓.
+func RestampOrphans(now time.Time) bool { return restamp(now, true) }
+
+// sweeping keeps two sweeps from relabelling the same tabs at once, which a day
+// rolling over mid-sweep would otherwise arrange. Its refusal is reported back
+// rather than swallowed: the caller has a rollover to spend and needs to know
+// it did not land, or a sweep that spans midnight silently costs the next day
+// its own.
+var sweeping atomic.Bool
+
+// restamp reads history on the caller's goroutine — the ordering against the
+// daemon's prune depends on it — and does the talking to herdr in the
+// background, where a wedged call cannot stop the schedule. It reports whether
+// the sweep was started.
+func restamp(now time.Time, orphans bool) bool {
+	if !sweeping.CompareAndSwap(false, true) {
+		return false // an earlier sweep is still going; the caller will retry
+	}
+	runs, err := history.Runs("", 0)
+	if err != nil {
+		log.Printf("cannot read history to date the labels of older runs: %v", err)
+		sweeping.Store(false)
+		return false
+	}
+	go func() {
+		defer sweeping.Store(false)
+		tabs, workspaces, err := herdr.LiveTargets()
+		if err != nil {
+			log.Printf("cannot ask herdr what is still open, leaving older labels alone: %v", err)
+			return
+		}
+		for _, r := range stale(runs, tabs, workspaces, now, orphans) {
+			if err := relabelRun(r, r.Status, now); err != nil {
+				log.Printf("%s: dating the label of run %s: %v", r.Automation, r.RunID, err)
+			}
+		}
+	}()
+	return true
+}
+
+// daemonRan reports whether the daemon executed a run itself, and so whether
+// its own restart is proof the run is over. A record from before triggers were
+// written says nothing, and is treated as not the daemon's.
+func daemonRan(trigger string) bool {
+	return trigger == TriggerCron || trigger == TriggerCatchUp
+}
+
+// stale picks the runs still on screen whose labels no longer say which day
+// they ran. Runs in flight are left to relabel themselves when they end, unless
+// orphans is set — see RestampOrphans.
+func stale(runs []history.Record, tabs, workspaces map[string]bool, now time.Time, orphans bool) []history.Record {
+	var out []history.Record
+	for _, r := range runs {
+		switch {
+		case sameDay(startedAt(r), now):
+			continue // today's label is unambiguous as it stands
+		case r.Status == history.StatusRunning && !(orphans && daemonRan(r.Trigger)):
+			continue // see RestampOrphans
+		case r.TabID != "":
+			if !tabs[r.TabID] {
+				continue
+			}
+		case r.Placement == string(config.PlacementWorkspace):
+			if !workspaces[r.WorkspaceID] {
+				continue
+			}
+		default:
+			continue // holds nothing it may name; see relabelRun
+		}
+		out = append(out, r)
+	}
+	return out
+}
+
+// startedAt is when a run's label says it ran. Runs recorded before Started
+// existed fall back to their last transition, which approximates it: the clock
+// time shifts by however long the run took, and one that crossed midnight lands
+// on the wrong day outright. A one-off wobble on labels written by an older
+// version, in exchange for being able to date them at all.
+func startedAt(r history.Record) time.Time {
+	if r.Started.IsZero() {
+		return r.At
+	}
+	return r.Started
+}
+
+// relabelRun restamps a run's tab or workspace, whichever it holds. The status
+// is passed rather than read off the record so a caller can label a run for the
+// outcome it is in the middle of writing.
+func relabelRun(r history.Record, st history.Status, now time.Time) error {
+	label := runLabel(r.Automation, startedAt(r), now, st)
+	switch {
+	case r.TabID != "":
+		return herdr.TabRename(r.TabID, label)
+	case r.Placement == string(config.PlacementWorkspace) && r.WorkspaceID != "":
+		return herdr.WorkspaceRename(r.WorkspaceID, label)
+	}
+	// Anything else holds nothing it may name. A shared run that never got its
+	// tab recorded the workspace every other automation lives in, and a record
+	// written before placement existed cannot be told apart from one — naming
+	// either after a single run relabels all of their homes. Retirement
+	// fail-closes on the same ambiguity; see closable.
+	return nil
 }
 
 // expired picks which of an automation's past runs, newest first, have to give
@@ -637,21 +790,23 @@ type journal struct {
 
 func newJournal(a config.Automation, trigger string) *journal {
 	id, token := newRunID(a.Name)
+	start := time.Now()
 	return &journal{
 		rec: history.Record{
 			RunID:      id,
 			Automation: a.Name,
 			Trigger:    trigger,
 			Placement:  string(a.Placement),
+			Started:    start,
 		},
 		token: token,
-		start: time.Now(),
+		start: start,
 	}
 }
 
 // label names this run's pane at a given point in its life.
 func (j *journal) label(st history.Status) string {
-	return runLabel(j.rec.Automation, j.start, st)
+	return runLabel(j.rec.Automation, j.start, time.Now(), st)
 }
 
 // capturedLines is how much of the agent's terminal is kept. Enough for a
@@ -682,17 +837,61 @@ func (j *journal) capture() bool {
 // relabel restamps the run's pane with how it ended, so a glance at the shared
 // workspace tells you which runs are worth opening.
 func (j *journal) relabel(st history.Status) {
-	label := j.label(st)
-	var err error
-	switch {
-	case j.rec.TabID != "":
-		err = herdr.TabRename(j.rec.TabID, label)
-	case j.rec.WorkspaceID != "":
-		err = herdr.WorkspaceRename(j.rec.WorkspaceID, label)
-	}
-	if err != nil {
+	if err := relabelRun(j.rec, st, time.Now()); err != nil {
 		log.Printf("%s: relabelling the finished run: %v", j.rec.Automation, err)
 	}
+	j.describePane()
+}
+
+// describePane copies the agent's terminal title onto its pane, so the row
+// under the tab says what the run did instead of repeating the automation's
+// name with a run token stuck on the end. The title has to be taken now: it
+// belongs to a live terminal, and retirement throws that away.
+//
+// Failure is logged and otherwise ignored, leaving the pane as it was: a
+// description is a nicety, and the run has already succeeded or failed on its
+// own merits.
+func (j *journal) describePane() {
+	if j.rec.PaneID == "" {
+		return
+	}
+	title, err := herdr.PaneTitle(j.rec.PaneID)
+	if err != nil {
+		log.Printf("%s: reading the run's terminal title: %v", j.rec.Automation, err)
+		return
+	}
+	if !describes(title, j.rec.Automation) {
+		return
+	}
+	if err := herdr.PaneRename(j.rec.PaneID, title); err != nil {
+		log.Printf("%s: labelling the run's pane: %v", j.rec.Automation, err)
+	}
+}
+
+// shellPrompt matches the title a terminal carries when nothing is running in
+// it: "user@host:~/code/repo", optionally behind a virtualenv marker. The path
+// after the colon is what makes it a prompt rather than prose — without it,
+// "alice@example.com: rotate the key" would be read as one. Rejecting a real
+// description costs more than letting an odd one through: what we fall back to
+// is the label this is meant to improve on.
+var shellPrompt = regexp.MustCompile(`^(\(\S+\) )?[^\s@]+@[^\s:]+:[~/]`)
+
+// describes reports whether a terminal title is worth showing. An agent that
+// never took the prompt leaves its own idle title ("Claude Code") or the
+// shell's, and a title that merely echoes the automation's name adds nothing
+// the tab above it does not already carry.
+func describes(title, automation string) bool {
+	switch {
+	case title == "":
+		return false
+	case shellPrompt.MatchString(title):
+		return false // the agent never got started
+	case strings.EqualFold(title, "Claude Code"), strings.EqualFold(title, "Codex"):
+		return false // an agent sitting idle, never told what to do
+	case strings.EqualFold(title, automation):
+		return false
+	}
+	return true
 }
 
 func (j *journal) record(st history.Status, errMsg string) {

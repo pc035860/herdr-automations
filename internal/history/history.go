@@ -30,10 +30,17 @@ const (
 )
 
 type Record struct {
-	RunID       string    `json:"run_id"`
-	Automation  string    `json:"automation"`
-	Status      Status    `json:"status"`
-	At          time.Time `json:"at"`
+	RunID      string    `json:"run_id"`
+	Automation string    `json:"automation"`
+	Status     Status    `json:"status"`
+	At         time.Time `json:"at"`
+	// Started is when the run began, as opposed to At, which moves with every
+	// transition. Labels are stamped with it, so relabelling a run long after
+	// it finished — dating a pane that outlived its day — reproduces the same
+	// clock time instead of drifting to whenever the relabel happened.
+	// omitzero, not omitempty: a time.Time is a struct, and omitempty would
+	// write the year-1 sentinel into every record instead of leaving it out.
+	Started     time.Time `json:"started,omitzero"`
 	Trigger     string    `json:"trigger,omitempty"` // cron | manual
 	WorkspaceID string    `json:"workspace_id,omitempty"`
 	// Placement records whether this run owned its workspace or only a tab in

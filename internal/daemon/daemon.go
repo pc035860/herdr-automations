@@ -52,6 +52,15 @@ func Run() error {
 	defer prune.Stop()
 
 	evaluate(state) // don't wait a full tick to notice what is already due
+	// Before pruning, not after: a daemon that was down longer than the history
+	// window would otherwise drop the records of panes that are still on screen,
+	// and a pane whose record is gone can no longer be relabelled.
+	// Before the prune, whose window a long-stopped daemon would otherwise take
+	// the records of still-open panes with. RestampOrphans reads history here
+	// and relabels in the background, so the ordering holds without a wedged
+	// herdr call keeping the daemon out of its loop.
+	day := startOfDay(time.Now())
+	runner.RestampOrphans(time.Now())
 	pruneHistory()
 
 	for {
@@ -62,12 +71,48 @@ func Run() error {
 			if stamp := binaryStamp(); stamp != binary && stamp != "" {
 				restart(release)
 			}
+			// Yesterday's kept panes are labelled with a bare clock time, which
+			// stops being unambiguous the moment today's run puts an identically
+			// labelled tab beside it. A ticker cannot be used for this — it would
+			// drift off midnight — so the rollover is watched for directly, and
+			// only forwards: a clock corrected backwards past midnight would
+			// otherwise date panes that are once again from today, and nothing
+			// takes a date back off.
+			//
+			// The day is remembered even when it went backwards, so a clock
+			// corrected back and then forward again sweeps on its return —
+			// runs started meanwhile need dating too, and sweeping a day twice
+			// costs a few renames that write what is already there.
+			// The new day is only taken as swept once a sweep actually starts.
+			// One that spans midnight turns the next rollover away, and giving
+			// the day up regardless would cost that day its sweep entirely.
+			if d, rolled := dayRolledOver(day, time.Now()); !rolled {
+				day = d
+			} else if runner.RestampStale(time.Now()) {
+				day = d
+			}
 			evaluate(state)
 		case s := <-sigs:
 			log.Printf("received %v, shutting down", s)
 			return nil
 		}
 	}
+}
+
+// startOfDay is the calendar day a moment falls in, kept as a time so two of
+// them can be compared for direction and not merely for difference.
+func startOfDay(t time.Time) time.Time {
+	y, m, d := t.Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, t.Location())
+}
+
+// dayRolledOver reports whether now falls on a later calendar day than the one
+// last swept, along with the day to remember. Direction matters: dating a label
+// is one-way, so a clock corrected backwards past midnight must not stamp a
+// date onto panes that turn out to be from today after all.
+func dayRolledOver(swept, now time.Time) (time.Time, bool) {
+	d := startOfDay(now)
+	return d, d.After(swept)
 }
 
 // evaluate fires every automation whose occurrence has come due, and records

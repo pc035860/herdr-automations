@@ -104,10 +104,11 @@ func run(out any, args ...string) error {
 	return nil
 }
 
-// tolerant runs a command whose target may already be gone. Retirement is
-// best-effort bookkeeping, so a workspace you closed by hand is a success.
+// tolerant runs a command whose target may already be gone. Retiring and
+// labelling are both best-effort bookkeeping over things the user can close by
+// hand at any moment, so a target that has since disappeared is a success.
 func tolerant(args ...string) error {
-	if err := run(nil, args...); err != nil && !hasCode(err, codeWorkspaceGone, codeTabGone) {
+	if err := run(nil, args...); err != nil && !hasCode(err, codeWorkspaceGone, codeTabGone, codePaneGone) {
 		return err
 	}
 	return nil
@@ -122,6 +123,27 @@ func PaneTail(paneID string, lines int) (string, error) {
 		"--format", "text")
 	return string(out), err
 }
+
+// PaneTitle reads the title the agent set on its terminal — for Claude Code, a
+// short summary of the work it took on ("執行 graph-dream skill"). It says what
+// the run was about rather than which automation produced it, which nothing
+// else on screen does, and it is thrown away with the pane.
+func PaneTitle(paneID string) (string, error) {
+	var res struct {
+		Pane struct {
+			Title string `json:"terminal_title_stripped"`
+		} `json:"pane"`
+	}
+	if err := run(&res, "pane", "get", paneID); err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(res.Pane.Title), nil
+}
+
+// PaneRename labels a pane. Without one, the navigator falls back to the pane's
+// agent name — which for an automation is its own name plus a run token, so the
+// row under a tab says nothing the tab did not already say.
+func PaneRename(paneID, label string) error { return tolerant("pane", "rename", paneID, label) }
 
 // apiError turns herdr's JSON error envelope into a typed error. Without this
 // the raw payload ends up in logs and, worse, in the board's status line.
@@ -188,6 +210,39 @@ func WorkspaceCreate(cwd, label string) (workspaceID, paneID string, err error) 
 		return "", "", err
 	}
 	return res.ids("workspace create")
+}
+
+// LiveTargets reports which tabs and workspaces herdr currently holds. Asking
+// is what lets a caller act on the runs still on screen without guessing from
+// history how far back to look: the log remembers runs whose panes were closed
+// months ago, and the ones worth touching are exactly the ones herdr still
+// knows about.
+func LiveTargets() (tabs, workspaces map[string]bool, err error) {
+	var ws struct {
+		Workspaces []struct {
+			WorkspaceID string `json:"workspace_id"`
+		} `json:"workspaces"`
+	}
+	if err := run(&ws, "workspace", "list"); err != nil {
+		return nil, nil, err
+	}
+	var tb struct {
+		Tabs []struct {
+			TabID string `json:"tab_id"`
+		} `json:"tabs"`
+	}
+	if err := run(&tb, "tab", "list"); err != nil {
+		return nil, nil, err
+	}
+	tabs = make(map[string]bool, len(tb.Tabs))
+	for _, t := range tb.Tabs {
+		tabs[t.TabID] = true
+	}
+	workspaces = make(map[string]bool, len(ws.Workspaces))
+	for _, w := range ws.Workspaces {
+		workspaces[w.WorkspaceID] = true
+	}
+	return tabs, workspaces, nil
 }
 
 // WorkspaceFind returns the id of the workspace carrying label, or "" when

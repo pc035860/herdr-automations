@@ -11,6 +11,16 @@ import (
 	"github.com/DnzzL/herdr-automations/internal/history"
 )
 
+// ids names the runs a selection picked, so a failure says which runs were
+// chosen rather than dumping whole records.
+func ids(rs []history.Record) []string {
+	out := []string{}
+	for _, r := range rs {
+		out = append(out, r.RunID)
+	}
+	return out
+}
+
 func TestExpiredKeepsTheNewestAndAllowsFailuresMore(t *testing.T) {
 	// Newest first, as history.Runs returns them.
 	runs := []history.Record{
@@ -21,14 +31,6 @@ func TestExpiredKeepsTheNewestAndAllowsFailuresMore(t *testing.T) {
 		{RunID: "2", Status: history.StatusMissed}, // never got a pane
 		{RunID: "1", Status: history.StatusFailed, PaneID: "p1"},
 	}
-	ids := func(rs []history.Record) []string {
-		out := []string{}
-		for _, r := range rs {
-			out = append(out, r.RunID)
-		}
-		return out
-	}
-
 	// keep 1: the incoming run takes the single success slot, so both earlier
 	// successes go; two failures fit inside an allowance of three.
 	if got := ids(expired(runs, 1, 3)); !slices.Equal(got, []string{"5", "3"}) {
@@ -131,14 +133,193 @@ func TestLimiterBoundsConcurrentRuns(t *testing.T) {
 
 func TestRunLabelCarriesTimeAndOutcome(t *testing.T) {
 	start := time.Date(2026, 8, 14, 7, 3, 0, 0, time.UTC)
+	now := start.Add(20 * time.Minute)
 	cases := map[history.Status]string{
-		history.StatusRunning: "▶ daily-graph-dream 07:03",
-		history.StatusDone:    "✓ daily-graph-dream 07:03",
-		history.StatusFailed:  "✗ daily-graph-dream 07:03",
+		history.StatusRunning: "▶ 07:03 daily-graph-dream",
+		history.StatusDone:    "✓ 07:03 daily-graph-dream",
+		history.StatusFailed:  "✗ 07:03 daily-graph-dream",
 	}
 	for st, want := range cases {
-		if got := runLabel("daily-graph-dream", start, st); got != want {
+		if got := runLabel("daily-graph-dream", start, now, st); got != want {
 			t.Errorf("runLabel(%s) = %q, want %q", st, got, want)
+		}
+	}
+}
+
+func TestRunLabelDatesARunThatOutlivedItsDay(t *testing.T) {
+	start := time.Date(2026, 8, 14, 7, 3, 0, 0, time.UTC)
+
+	// The next morning a kept failure sits beside today's run of the same
+	// automation. Without the date the two labels are identical but for the
+	// glyph, which is exactly the case the date exists for.
+	tomorrow := time.Date(2026, 8, 15, 9, 0, 0, 0, time.UTC)
+	if got, want := runLabel("daily-graph-dream", start, tomorrow, history.StatusFailed),
+		"✗ 8/14 07:03 daily-graph-dream"; got != want {
+		t.Errorf("runLabel a day later = %q, want %q", got, want)
+	}
+
+	// A run that started before midnight and ended after it is still dated by
+	// when it started, so its label matches the occurrence it belongs to.
+	lateNight := time.Date(2026, 8, 14, 23, 50, 0, 0, time.UTC)
+	if got, want := runLabel("nightly", lateNight, lateNight.Add(30*time.Minute), history.StatusDone),
+		"✓ 8/14 23:50 nightly"; got != want {
+		t.Errorf("runLabel across midnight = %q, want %q", got, want)
+	}
+}
+
+func TestStalePicksOnlyLabelsThatWentAmbiguous(t *testing.T) {
+	now := time.Date(2026, 8, 15, 9, 0, 0, 0, time.UTC)
+	yesterday := time.Date(2026, 8, 14, 7, 0, 0, 0, time.UTC)
+
+	rec := func(id string, st history.Status, started time.Time) history.Record {
+		return history.Record{
+			RunID: id, Automation: "daily-graph-dream", Status: st, Trigger: TriggerCron,
+			Started: started, At: started, PaneID: "w9:p" + id, TabID: "w9:t" + id,
+		}
+	}
+	runs := []history.Record{
+		rec("today", history.StatusDone, now.Add(-2*time.Hour)),
+		rec("yesterday", history.StatusFailed, yesterday),
+		// A run whose tab the user closed by hand. History still has it; herdr
+		// does not, and renaming it would be a rename aimed at nothing.
+		rec("closed", history.StatusDone, yesterday),
+		// Still going, and started before midnight: its label is a bare clock
+		// time right now, and if the daemon dies mid-run nothing else ever
+		// comes back for it.
+		rec("running", history.StatusRunning, yesterday),
+		{RunID: "nowhere", Status: history.StatusFailed, Started: yesterday, PaneID: "w9:pX"},
+	}
+	tabs := map[string]bool{"w9:tyesterday": true, "w9:trunning": true, "w9:ttoday": true}
+
+	got := ids(stale(runs, tabs, nil, now, false))
+	if !slices.Equal(got, []string{"yesterday"}) {
+		t.Errorf("stale = %v, want [yesterday]: today's label is still unambiguous, "+
+			"a closed tab is not there to rename, a run that never got a tab has "+
+			"nowhere to put a label, and one in flight would have its ✓ overwritten "+
+			"with ▶ if this got there second", got)
+	}
+
+	// At startup, though, a cron record stuck at running belongs to a run that
+	// died with the daemon that started it. Nothing else will ever relabel it.
+	got = ids(stale(runs, tabs, nil, now, true))
+	if !slices.Equal(got, []string{"yesterday", "running"}) {
+		t.Errorf("stale(orphans) = %v, want [yesterday running]", got)
+	}
+}
+
+func TestOrphansAreOnlyTheRunsTheDaemonItselfStarted(t *testing.T) {
+	// The board and the CLI run manual automations in their own process, which
+	// outlives a daemon restart — so a manual run recorded running may well
+	// still be running, and dating it now would put ▶ back over the ✓ it is
+	// about to write. A record too old to say how it was triggered gets the
+	// same benefit of the doubt.
+	now := time.Date(2026, 8, 15, 9, 0, 0, 0, time.UTC)
+	rec := func(id, trigger string) history.Record {
+		return history.Record{
+			RunID: id, Automation: "daily-graph-dream", Status: history.StatusRunning,
+			Trigger: trigger, Started: now.AddDate(0, 0, -1),
+			PaneID: "w9:p" + id, TabID: "w9:t" + id,
+		}
+	}
+	runs := []history.Record{
+		rec("cron", TriggerCron),
+		rec("catchup", TriggerCatchUp),
+		rec("manual", TriggerManual),
+		rec("legacy", ""),
+	}
+	tabs := map[string]bool{"w9:tcron": true, "w9:tcatchup": true, "w9:tmanual": true, "w9:tlegacy": true}
+
+	got := ids(stale(runs, tabs, nil, now, true))
+	if !slices.Equal(got, []string{"cron", "catchup"}) {
+		t.Errorf("stale(orphans) = %v, want only the runs the daemon ran itself", got)
+	}
+}
+
+func TestOnlyOneSweepRunsAtATime(t *testing.T) {
+	// The caller has a rollover to spend and has to be told the sweep did not
+	// land, or a sweep spanning midnight quietly costs the next day its own.
+	sweeping.Store(true)
+	defer sweeping.Store(false)
+	if restamp(time.Now(), false) {
+		t.Error("restamp claimed to have started a sweep while one was running")
+	}
+}
+
+func TestStaleReachesRunsNoRetirementWould(t *testing.T) {
+	// The panes most likely to sit on screen for days belong to automations that
+	// retire nothing or never run again, and there is no bound on how far back
+	// they go — so what counts is whether herdr still holds the tab, not how
+	// deep into history the run sits.
+	now := time.Date(2026, 8, 15, 9, 0, 0, 0, time.UTC)
+	kept := history.Record{
+		RunID: "old", Automation: "once-off", Status: history.StatusDone,
+		Started: now.AddDate(0, 0, -400), PaneID: "w9:p1", TabID: "w9:t1",
+	}
+	tabs := map[string]bool{"w9:t1": true}
+	if got := ids(stale([]history.Record{kept}, tabs, nil, now, false)); !slices.Equal(got, []string{"old"}) {
+		t.Errorf("stale = %v, want the year-old kept run dated", got)
+	}
+}
+
+func TestStaleOnlyNamesAWorkspaceItIsSureOf(t *testing.T) {
+	// A run holding a workspace id and no tab is either an automation that owns
+	// that workspace, or a shared run that died between claiming the shared one
+	// and opening its tab. Renaming the latter names every other automation's
+	// home after this one run, so only an explicit placement may be acted on —
+	// the same ambiguity retirement fail-closes on.
+	now := time.Date(2026, 8, 15, 9, 0, 0, 0, time.UTC)
+	yesterday := now.AddDate(0, 0, -1)
+	rec := func(id, placement string) history.Record {
+		return history.Record{
+			RunID: id, Automation: "daily-graph-dream", Status: history.StatusFailed,
+			Started: yesterday, WorkspaceID: "w9", Placement: placement,
+		}
+	}
+	shared := rec("shared", "shared")
+	legacy := rec("legacy", "") // written before placement was recorded
+	own := rec("own", "workspace")
+	workspaces := map[string]bool{"w9": true}
+
+	got := ids(stale([]history.Record{shared, legacy, own}, nil, workspaces, now, false))
+	if !slices.Equal(got, []string{"own"}) {
+		t.Errorf("stale = %v, want [own]: neither a shared run nor one whose "+
+			"placement was never recorded may name the workspace it holds", got)
+	}
+	for _, r := range []history.Record{shared, legacy} {
+		if err := relabelRun(r, r.Status, now); err != nil {
+			t.Errorf("relabelRun(%s) = %v, want it to decline silently", r.RunID, err)
+		}
+	}
+}
+
+func TestStartedAtFallsBackForOlderRecords(t *testing.T) {
+	// Records written before Started existed still have to be datable, or the
+	// very labels this fixes — yesterday's, already on screen — stay ambiguous.
+	end := time.Date(2026, 8, 14, 7, 12, 0, 0, time.UTC)
+	if got := startedAt(history.Record{At: end}); !got.Equal(end) {
+		t.Errorf("startedAt(no Started) = %v, want the last transition %v", got, end)
+	}
+	start := end.Add(-12 * time.Minute)
+	if got := startedAt(history.Record{At: end, Started: start}); !got.Equal(start) {
+		t.Errorf("startedAt = %v, want the run's start %v", got, start)
+	}
+}
+
+func TestDescribesRejectsTitlesThatSayNothing(t *testing.T) {
+	cases := map[string]bool{
+		"執行 graph-dream skill":                      true,
+		"Fix @scope/pkg: request timeout":           true, // an @ and a colon, but a real summary
+		"Review PR #12 — auth: token refresh":       true,
+		"alice@example.com: rotate the signing key": true, // an address, not a prompt
+		"":                                     false,
+		"Claude Code":                          false, // the agent never took a prompt
+		"pc035860@PCMac-Studio:~/code/laplace": false, // no agent at all, just a shell
+		"(venv) pc035860@PCMac-Studio:/tmp/scratch": false,
+		"daily-graph-dream":                         false, // the tab above already says this
+	}
+	for title, want := range cases {
+		if got := describes(title, "daily-graph-dream"); got != want {
+			t.Errorf("describes(%q) = %v, want %v", title, got, want)
 		}
 	}
 }

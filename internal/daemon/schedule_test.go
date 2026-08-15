@@ -114,3 +114,38 @@ func TestStateFilesWrittenBeforeOnceStillLoad(t *testing.T) {
 	// a one-time automation finishes.
 	s.Completed["nightly"] = time.Now()
 }
+
+func TestDayRolloverOnlyFiresGoingForward(t *testing.T) {
+	swept := time.Date(2026, 8, 14, 0, 0, 0, 0, time.UTC)
+
+	// Later the same day: the labels written this morning still say today.
+	if _, rolled := dayRolledOver(swept, swept.Add(23*time.Hour)); rolled {
+		t.Error("rolled over within the same day, sweeping for nothing")
+	}
+	// Midnight: yesterday's kept panes are about to sit beside today's runs.
+	next, rolled := dayRolledOver(swept, swept.AddDate(0, 0, 1))
+	if !rolled || !next.Equal(swept.AddDate(0, 0, 1)) {
+		t.Errorf("dayRolledOver at midnight = %v, %v, want the new day", next, rolled)
+	}
+	// Asleep for a week: one sweep on waking covers all of it.
+	if _, rolled := dayRolledOver(swept, swept.AddDate(0, 0, 7)); !rolled {
+		t.Error("a week's sleep did not roll over")
+	}
+	// A clock corrected backwards past midnight and then forward again, as the
+	// daemon would see it: 8/14 → 8/13 → 8/14. Dating is one-way, so going
+	// backwards must not sweep. Coming back must, though — runs started while
+	// the clock was behind need dating too — which only works if the caller
+	// remembers the day it went back to.
+	back := swept.AddDate(0, 0, -1)
+	day, rolled := dayRolledOver(swept, back)
+	if rolled {
+		t.Error("a backwards clock rolled over, dating panes that are from today")
+	}
+	if !day.Equal(back) {
+		t.Errorf("dayRolledOver going backwards returned %v, want the day to follow "+
+			"the clock back to %v, or its return is not seen as a rollover", day, back)
+	}
+	if _, rolled := dayRolledOver(day, swept); !rolled {
+		t.Error("returning to the original day did not roll over")
+	}
+}

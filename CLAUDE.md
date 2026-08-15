@@ -16,6 +16,8 @@ scripts/smoke.sh                                        # smoke test
 - board pane 每 2 秒重刷（`internal/pane/pane.go` 的 `tea.Tick`），顯示欄位每次 refresh 重算——相對時間類顯示不需額外刷新機制。
 - `scheduleCol` 常數必須等於 schedule 欄最寬的 rendering；改 `scheduleText` 的格式時要一起重算，且 name 欄寬度測試（`TestNameColumnGrowsIntoASpaciousPane`）的期望值會連動。
 - `once: true` 的語意是「工作要完成」不是「時刻要用掉」：failed run 不 spend，下一個 occurrence 會重試；board 的 `spent()` 以最後一筆 `StatusDone` 判斷。
+- shared placement 的 run 若沒拿到 tab，它記的 workspace 是**大家共用的那個**——改名或關掉會波及所有 automation。`closable` / `relabelRun` 都對此 fail-closed，只認明確的 `PlacementWorkspace`；`Placement` 為空的舊記錄一律不碰。
+- 任何「隨時間才變 stale」的顯示（例如過夜 run 的 label 要補日期）必須由 daemon 時鐘驅動，不要掛在 run 或 retire 上——`keep: -1` 與 `once:` 的 automation 不會再進 retire，正好是最需要補的那些。掃描對象問 `herdr.LiveTargets()`，不要用 history 的固定筆數窗口。
 
 ## Structure
 
@@ -38,3 +40,4 @@ scripts/smoke.sh                                        # smoke test
 - daemon：`once: true` automation 跑完一次自動 retire（記在 schedule state，YAML 免改）。
 - runner：run 完成判定收緊——確認 agent 真的收到 prompt、agent 只是 blocked 不算 done、關 pane fail-closed。
 - config：automation 可指定 agent 啟動環境（env）。
+- runner/daemon：tab label 改 `✓ 07:00 name`，過夜的 run 由 daemon 逐日補上日期；pane 改用 agent 自報的 terminal title 命名。
