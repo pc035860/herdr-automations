@@ -206,6 +206,9 @@ func sameDay(a, b time.Time) bool {
 // provision opens the pane this run will work in, recording what it claimed as
 // it goes so a failure part-way through still says what has to be cleaned up.
 func (j *journal) provision(a config.Automation) error {
+	// Both provisioning paths end up holding a pane, and a half-provisioned run
+	// still shows one, so the naming is deferred rather than repeated.
+	defer j.namePane(a)
 	label := j.label(history.StatusRunning)
 	if a.Placement == config.PlacementShared {
 		ws, err := sharedWorkspace()
@@ -225,6 +228,27 @@ func (j *journal) provision(a config.Automation) error {
 		j.rec.WorkspaceID, j.rec.PaneID, err = herdr.WorkspaceCreate(a.Repo, label)
 	}
 	return err
+}
+
+// namePane labels the pane the moment it exists, so the row under the tab says
+// something short for the whole of the run rather than only after it. Left
+// unnamed, the navigator falls back to the pane's agent name, and that carries
+// the run token which keeps it unique: "daily-graph-dream-5joj5k" sitting under
+// a tab that already said "daily-graph-dream".
+//
+// The agent kind is the one thing the tab above does not say, and it is what a
+// hand-made pane shows, so an automation's panes read like every other one.
+//
+// describePane replaces this later with the agent's own account of the work.
+// This is the floor rather than the last word: a run whose agent never set a
+// usable title now keeps a short label instead of falling back to the token.
+func (j *journal) namePane(a config.Automation) {
+	if j.rec.PaneID == "" || a.Agent == "" {
+		return
+	}
+	if err := herdr.PaneRename(j.rec.PaneID, a.Agent); err != nil {
+		log.Printf("%s: labelling the run's pane: %v", a.Name, err)
+	}
 }
 
 // retireScanDepth bounds how far back retirement looks. Anything older than
