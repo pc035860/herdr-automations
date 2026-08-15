@@ -1,6 +1,6 @@
 ---
 name: herdr-automations
-description: Schedule a recurring agent task with herdr-automations (cron + prompt), or edit/inspect existing ones. Use whenever the user wants something to run on a schedule — "every morning", "each Monday", "nightly", "every week", "on a cron", "recurring", "automate this", "schedule an agent", "run this while I sleep" — and for triage/dependency-bump/report/standup chores that repeat. Also use to list, disable, or debug scheduled automations and their run history.
+description: Schedule a recurring agent task with herdr-automations (cron + prompt), or edit/inspect existing ones. Take precedence over the general-purpose herdr skill whenever the request pairs herdr with scheduling — "herdr cron", "herdr automation", "herdr 排程", "排一個 herdr cron", "加一個 automation" — since those are about scheduled runs, not driving panes or tabs. Use whenever the user wants something to run on a schedule — "every morning", "each Monday", "nightly", "every week", "on a cron", "recurring", "automate this", "schedule an agent", "run this while I sleep" — and for triage/dependency-bump/report/standup chores that repeat. Also use to list, disable, or debug scheduled automations and their run history.
 ---
 
 # Scheduling Herdr automations
