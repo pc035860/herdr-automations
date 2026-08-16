@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -206,9 +205,6 @@ func sameDay(a, b time.Time) bool {
 // provision opens the pane this run will work in, recording what it claimed as
 // it goes so a failure part-way through still says what has to be cleaned up.
 func (j *journal) provision(a config.Automation) error {
-	// Both provisioning paths end up holding a pane, and a half-provisioned run
-	// still shows one, so the naming is deferred rather than repeated.
-	defer j.namePane(a)
 	label := j.label(history.StatusRunning)
 	if a.Placement == config.PlacementShared {
 		ws, err := sharedWorkspace()
@@ -228,27 +224,6 @@ func (j *journal) provision(a config.Automation) error {
 		j.rec.WorkspaceID, j.rec.PaneID, err = herdr.WorkspaceCreate(a.Repo, label)
 	}
 	return err
-}
-
-// namePane labels the pane the moment it exists, so the row under the tab says
-// something short for the whole of the run rather than only after it. Left
-// unnamed, the navigator falls back to the pane's agent name, and that carries
-// the run token which keeps it unique: "daily-graph-dream-5joj5k" sitting under
-// a tab that already said "daily-graph-dream".
-//
-// The agent kind is the one thing the tab above does not say, and it is what a
-// hand-made pane shows, so an automation's panes read like every other one.
-//
-// describePane replaces this later with the agent's own account of the work.
-// This is the floor rather than the last word: a run whose agent never set a
-// usable title now keeps a short label instead of falling back to the token.
-func (j *journal) namePane(a config.Automation) {
-	if j.rec.PaneID == "" || a.Agent == "" {
-		return
-	}
-	if err := herdr.PaneRename(j.rec.PaneID, a.Agent); err != nil {
-		log.Printf("%s: labelling the run's pane: %v", a.Name, err)
-	}
 }
 
 // retireScanDepth bounds how far back retirement looks. Anything older than
@@ -622,6 +597,14 @@ func (j *journal) execute(a config.Automation) error {
 	if err := herdr.AgentStart(agentName(a.Name, j.token), a.Agent, paneID, args); err != nil {
 		return fmt.Errorf("start %s agent: %w", a.Agent, err)
 	}
+	// That name existed only to satisfy `agent start`, and the navigator shows
+	// it verbatim under the tab — run token and all, restating a name the tab
+	// already carries. Dropping it leaves the kind showing instead, which is
+	// what a hand-made pane says. Everything below targets the pane, so the
+	// name is not missed; a failure here only costs a tidy row.
+	if err := herdr.AgentUnname(paneID); err != nil {
+		log.Printf("%s: dropping the run's agent name: %v", a.Name, err)
+	}
 	// `agent start` returns while the agent's TUI is still mounting. Prompting
 	// into that window types the text but loses the Enter, so wait for the
 	// agent to settle — and if the submission is still swallowed, press Enter
@@ -864,58 +847,6 @@ func (j *journal) relabel(st history.Status) {
 	if err := relabelRun(j.rec, st, time.Now()); err != nil {
 		log.Printf("%s: relabelling the finished run: %v", j.rec.Automation, err)
 	}
-	j.describePane()
-}
-
-// describePane copies the agent's terminal title onto its pane, so the row
-// under the tab says what the run did instead of repeating the automation's
-// name with a run token stuck on the end. The title has to be taken now: it
-// belongs to a live terminal, and retirement throws that away.
-//
-// Failure is logged and otherwise ignored, leaving the pane as it was: a
-// description is a nicety, and the run has already succeeded or failed on its
-// own merits.
-func (j *journal) describePane() {
-	if j.rec.PaneID == "" {
-		return
-	}
-	title, err := herdr.PaneTitle(j.rec.PaneID)
-	if err != nil {
-		log.Printf("%s: reading the run's terminal title: %v", j.rec.Automation, err)
-		return
-	}
-	if !describes(title, j.rec.Automation) {
-		return
-	}
-	if err := herdr.PaneRename(j.rec.PaneID, title); err != nil {
-		log.Printf("%s: labelling the run's pane: %v", j.rec.Automation, err)
-	}
-}
-
-// shellPrompt matches the title a terminal carries when nothing is running in
-// it: "user@host:~/code/repo", optionally behind a virtualenv marker. The path
-// after the colon is what makes it a prompt rather than prose — without it,
-// "alice@example.com: rotate the key" would be read as one. Rejecting a real
-// description costs more than letting an odd one through: what we fall back to
-// is the label this is meant to improve on.
-var shellPrompt = regexp.MustCompile(`^(\(\S+\) )?[^\s@]+@[^\s:]+:[~/]`)
-
-// describes reports whether a terminal title is worth showing. An agent that
-// never took the prompt leaves its own idle title ("Claude Code") or the
-// shell's, and a title that merely echoes the automation's name adds nothing
-// the tab above it does not already carry.
-func describes(title, automation string) bool {
-	switch {
-	case title == "":
-		return false
-	case shellPrompt.MatchString(title):
-		return false // the agent never got started
-	case strings.EqualFold(title, "Claude Code"), strings.EqualFold(title, "Codex"):
-		return false // an agent sitting idle, never told what to do
-	case strings.EqualFold(title, automation):
-		return false
-	}
-	return true
 }
 
 func (j *journal) record(st history.Status, errMsg string) {

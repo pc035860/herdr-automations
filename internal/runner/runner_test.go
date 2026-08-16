@@ -305,25 +305,6 @@ func TestStartedAtFallsBackForOlderRecords(t *testing.T) {
 	}
 }
 
-func TestDescribesRejectsTitlesThatSayNothing(t *testing.T) {
-	cases := map[string]bool{
-		"執行 graph-dream skill":                      true,
-		"Fix @scope/pkg: request timeout":           true, // an @ and a colon, but a real summary
-		"Review PR #12 — auth: token refresh":       true,
-		"alice@example.com: rotate the signing key": true, // an address, not a prompt
-		"":                                     false,
-		"Claude Code":                          false, // the agent never took a prompt
-		"pc035860@PCMac-Studio:~/code/laplace": false, // no agent at all, just a shell
-		"(venv) pc035860@PCMac-Studio:/tmp/scratch": false,
-		"daily-graph-dream":                         false, // the tab above already says this
-	}
-	for title, want := range cases {
-		if got := describes(title, "daily-graph-dream"); got != want {
-			t.Errorf("describes(%q) = %v, want %v", title, got, want)
-		}
-	}
-}
-
 func TestClosableRefusesEveryUncertainty(t *testing.T) {
 	shared := history.Record{
 		RunID: "r1", WorkspaceID: "w9", TabID: "w9:t2", PaneID: "w9:p2",

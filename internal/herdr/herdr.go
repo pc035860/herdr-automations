@@ -124,26 +124,16 @@ func PaneTail(paneID string, lines int) (string, error) {
 	return string(out), err
 }
 
-// PaneTitle reads the title the agent set on its terminal — for Claude Code, a
-// short summary of the work it took on ("執行 graph-dream skill"). It says what
-// the run was about rather than which automation produced it, which nothing
-// else on screen does, and it is thrown away with the pane.
-func PaneTitle(paneID string) (string, error) {
-	var res struct {
-		Pane struct {
-			Title string `json:"terminal_title_stripped"`
-		} `json:"pane"`
-	}
-	if err := run(&res, "pane", "get", paneID); err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(res.Pane.Title), nil
-}
-
-// PaneRename labels a pane. Without one, the navigator falls back to the pane's
-// agent name — which for an automation is its own name plus a run token, so the
-// row under a tab says nothing the tab did not already say.
-func PaneRename(paneID, label string) error { return tolerant("pane", "rename", paneID, label) }
+// AgentUnname drops the agent's name. The navigator's second row shows that
+// name and nothing else — not the pane's label, which `pane rename` sets and
+// which turns out to be invisible there — so an automation's rows read as
+// "daily-graph-dream-5joj5k" under a tab that already said the same thing.
+// Nameless, they fall back to the agent kind and read like every hand-made
+// pane: "claude".
+//
+// The name only has to survive `agent start`, which requires one; everything
+// after it targets the pane, so dropping it costs nothing.
+func AgentUnname(target string) error { return tolerant("agent", "rename", target, "--clear") }
 
 // apiError turns herdr's JSON error envelope into a typed error. Without this
 // the raw payload ends up in logs and, worse, in the board's status line.
