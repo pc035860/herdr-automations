@@ -53,10 +53,12 @@ func TestNameColumnGrowsIntoASpaciousPane(t *testing.T) {
 	if got := nameWidth(rows, 160); got != len(long) {
 		t.Errorf("nameWidth in a 160-col pane = %d, want %d", got, len(long))
 	}
-	// The pane the board was built for. The narrower schedule column leaves
-	// the name room to grow past the old fixed width, but not past its need.
-	if got := nameWidth(rows, 80); got != 29 {
-		t.Errorf("nameWidth in an 80-col pane = %d, want %d", got, 29)
+	// The pane the board was built for. With the model column in the line
+	// there is no spare room left at 80, so the name falls back to its
+	// minimum — the width it always had — rather than eating into a column
+	// that has a fixed rendering to fit.
+	if got := nameWidth(rows, 80); got != nameMin {
+		t.Errorf("nameWidth in an 80-col pane = %d, want %d", got, nameMin)
 	}
 	// Narrower than the board's own layout. Truncating the name is the
 	// accepted cost; shrinking below the old width is not, or the column the
@@ -79,8 +81,8 @@ func TestNameColumnLeavesTheOtherColumnsRoom(t *testing.T) {
 	// viewport, the full line has to fit in it once it is wide enough to.
 	rows := rowsNamed("an-automation-with-a-genuinely-long-name-here")
 	for view := 60; view <= 200; view++ {
-		line := 1 + nameWidth(rows, view) + 1 + cronCol + 1 + statusCol + 1 + scheduleCol
-		if view >= 1+nameMin+1+cronCol+1+statusCol+1+scheduleCol && line > view {
+		line := 1 + nameWidth(rows, view) + 1 + cronCol + 1 + statusCol + 1 + modelCol + 1 + scheduleCol
+		if view >= 1+nameMin+1+cronCol+1+statusCol+1+modelCol+1+scheduleCol && line > view {
 			t.Fatalf("at width %d the row needs %d columns", view, line)
 		}
 	}
@@ -136,5 +138,40 @@ func TestUntilTextPicksAReadableGranularity(t *testing.T) {
 		if got := untilText(c.d, at); got != c.want {
 			t.Errorf("untilText(%v) = %q, want %q", c.d, got, c.want)
 		}
+	}
+}
+
+func TestModelFieldReadsBackTheFlagTheAgentIsGiven(t *testing.T) {
+	model := func(args ...string) string {
+		return modelText(config.Automation{Name: "x", AgentArgs: args})
+	}
+
+	// The form every agent kind that takes a model understands, separated or
+	// joined, plus the short form codex and gemini also accept.
+	for _, args := range [][]string{
+		{"--model", "opus"},
+		{"--model=opus"},
+		{"-m", "opus"},
+		{"-m=opus"},
+		{"--dangerously-skip-permissions", "--model", "opus"},
+	} {
+		if got := model(args...); got != "opus" {
+			t.Errorf("modelText(%q) = %q, want %q", args, got, "opus")
+		}
+	}
+
+	// claude's --fallback-model names a different model for a different
+	// purpose. Matching on anything less than the whole token would report it
+	// as the model this automation runs on.
+	if got := model("--fallback-model", "sonnet"); got != "-" {
+		t.Errorf("modelText with only a fallback model = %q, want %q", got, "-")
+	}
+	// An agent left on its default has no flag to read, and neither does a
+	// --model someone left dangling with no value after it.
+	if got := model(); got != "-" {
+		t.Errorf("modelText with no args = %q, want %q", got, "-")
+	}
+	if got := model("--model"); got != "-" {
+		t.Errorf("modelText with a valueless --model = %q, want %q", got, "-")
 	}
 }

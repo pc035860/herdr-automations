@@ -290,6 +290,7 @@ func (m model) View() string {
 		name := fmt.Sprintf("%-*s", nameCol, truncate(r.auto.Name, nameCol))
 		cron := fmt.Sprintf("%-*s", cronCol, truncate(r.auto.Cron, cronCol))
 		status := fmt.Sprintf("%-*s", statusCol, statusText(r))
+		model := fmt.Sprintf("%-*s", modelCol, truncate(modelText(r.auto), modelCol))
 		next := scheduleText(r)
 
 		var line string
@@ -297,12 +298,12 @@ func (m model) View() string {
 		case i == m.cursor:
 			// One reverse-video span over the whole row: any nested color
 			// would end the highlight mid-line.
-			line = selectedStyle.Render(" " + name + " " + cron + " " + status + " " + next + " ")
+			line = selectedStyle.Render(" " + name + " " + cron + " " + status + " " + model + " " + next + " ")
 		case r.auto.Disabled:
-			line = dimStyle.Render(" " + name + " " + cron + " " + status + " " + next)
+			line = dimStyle.Render(" " + name + " " + cron + " " + status + " " + model + " " + next)
 		default:
 			line = " " + name + " " + cron + " " +
-				statusStyle(r).Render(status) + " " + dimStyle.Render(next)
+				statusStyle(r).Render(status) + " " + dimStyle.Render(model) + " " + dimStyle.Render(next)
 		}
 		s += line + "\n"
 	}
@@ -392,6 +393,10 @@ const (
 	nameMin   = 24
 	cronCol   = 16
 	statusCol = 15
+	// modelCol fits the short names a model is usually asked for by — opus,
+	// sonnet, haiku. A fully qualified id runs far longer than any column the
+	// board could spare, so it truncates.
+	modelCol = 8
 	// scheduleCol is not padded — it ends the line — but its widest rendering
 	// is what the name column must leave room for: "in 6d 23h · once".
 	scheduleCol = 16
@@ -406,10 +411,39 @@ func nameWidth(rows []row, view int) int {
 	for _, r := range rows {
 		longest = max(longest, len([]rune(r.auto.Name)))
 	}
-	// One leading space, three gaps between the four columns, and the columns
+	// One leading space, four gaps between the five columns, and the columns
 	// whose width is fixed.
-	spare := view - (1 + 3 + cronCol + statusCol + scheduleCol)
+	spare := view - (1 + 4 + cronCol + statusCol + modelCol + scheduleCol)
 	return min(max(longest, nameMin), max(nameMin, spare))
+}
+
+// modelText reads back the model the automation asks its agent for. There is
+// no model field in the config — a model reaches the agent as a verbatim flag
+// in agent_args — so the board parses the same flag the runner passes through.
+//
+// Every agent kind Herdr can start that takes a model at all spells it
+// --model, and the two offering a short form (codex, gemini) spell that -m,
+// which none of the others use for anything else — so accepting both is safe.
+// The comparison is on the whole token deliberately: claude's --fallback-model
+// is a different flag and must not be read as this one.
+//
+// Nothing found renders as a dash rather than blank. An agent left on its own
+// default is a real answer, and a column of empty cells reads as a rendering
+// bug instead.
+func modelText(a config.Automation) string {
+	for i, arg := range a.AgentArgs {
+		switch {
+		case arg == "--model" || arg == "-m":
+			if i+1 < len(a.AgentArgs) {
+				return a.AgentArgs[i+1]
+			}
+		case strings.HasPrefix(arg, "--model="):
+			return strings.TrimPrefix(arg, "--model=")
+		case strings.HasPrefix(arg, "-m="):
+			return strings.TrimPrefix(arg, "-m=")
+		}
+	}
+	return "-"
 }
 
 // scheduleText is the row's rightmost field: when this automation runs next,
