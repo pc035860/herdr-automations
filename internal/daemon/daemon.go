@@ -34,6 +34,16 @@ const (
 func Run() error {
 	log.SetPrefix("[herdr-automations] ")
 
+	// The daemon outlives the Herdr server that started it, and its log stream
+	// is that server's pipe. Once the far end is gone, Go's default handling of
+	// SIGPIPE on fd 1 and 2 kills the process at the next write — which is the
+	// line announcing the shutdown, so the shutdown never finished. Asking for
+	// the signal on a channel nobody reads is what makes the write fail quietly
+	// instead; ignoring it outright would be inherited by every herdr command
+	// spawned from here, and change how those behave in a pipeline of their own.
+	dropped := make(chan os.Signal, 1)
+	signal.Notify(dropped, syscall.SIGPIPE)
+
 	release, err := acquireLock()
 	if err != nil {
 		return err
@@ -69,7 +79,7 @@ func Run() error {
 			pruneHistory()
 		case <-tick.C:
 			if stamp := binaryStamp(); stamp != binary && stamp != "" {
-				restart(release)
+				restart()
 			}
 			// Yesterday's kept panes are labelled with a bare clock time, which
 			// stops being unambiguous the moment today's run puts an identically
@@ -270,7 +280,11 @@ func recordMissed(name string, count int, why string) {
 
 // restart re-executes the daemon so a plugin upgrade takes effect without
 // waiting for the Herdr server to be restarted.
-func restart(release func()) {
+// The lock is not released here. A successful exec drops it on its own — the
+// descriptor holding it is close-on-exec, so the new image finds it free — and
+// an exec that fails leaves this daemon running, which is precisely when it
+// still needs to be the only one.
+func restart() {
 	if runner.Busy() {
 		return // let the in-flight run finish; we'll notice again next tick
 	}
@@ -280,7 +294,6 @@ func restart(release func()) {
 		return
 	}
 	log.Printf("binary changed, re-executing %s", exe)
-	release() // the new process takes the lock
 	if err := syscall.Exec(exe, os.Args, os.Environ()); err != nil {
 		log.Printf("re-exec failed, continuing with the old build: %v", err)
 	}
