@@ -2,11 +2,13 @@ package daemon
 
 import (
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/DnzzL/herdr-automations/internal/config"
 )
@@ -28,6 +30,27 @@ import (
 // unlink the inode another is already holding, leaving both to believe they are
 // the only scheduler. An idle lock file costs nothing.
 func acquireLock() (release func(), err error) {
+	return acquireLockWithin(lockWait)
+}
+
+const (
+	// lockWait is how long a starting daemon waits for the holder to let go
+	// before it gives up. A Herdr server handoff runs the startup hook while the
+	// daemon the old server started is still shutting down: the hook's daemon
+	// used to refuse at that instant, the old one finished dying a moment later,
+	// and the machine was left with no scheduler at all until someone noticed
+	// the reports had stopped. Long enough to cover that teardown, short enough
+	// that a hook facing a healthy daemon does not sit here for the machine's
+	// uptime.
+	lockWait = 10 * time.Second
+	// lockPoll is how often the lock is retried while waiting. The holder
+	// releases by closing a descriptor, so there is nothing to be woken by.
+	lockPoll = 100 * time.Millisecond
+)
+
+// acquireLockWithin is acquireLock with the wait spelled out, so a test can
+// exercise the waiting without spending the production timeout on it.
+func acquireLockWithin(wait time.Duration) (release func(), err error) {
 	if err := os.MkdirAll(config.StateDir(), 0o755); err != nil {
 		return nil, err
 	}
@@ -37,17 +60,35 @@ func acquireLock() (release func(), err error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		held := recordedPID(f)
-		f.Close()
+
+	deadline := time.Now().Add(wait)
+	announced := false
+	for {
+		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			break
+		}
 		// Only a refusal to wait means someone else has it. Anything else — a
 		// filesystem without locks, a bad descriptor — is its own failure, and
 		// saying "another daemon is already running" would send whoever reads
 		// the log hunting for a process that does not exist.
-		if err == syscall.EWOULDBLOCK {
+		if err != syscall.EWOULDBLOCK {
+			f.Close()
+			return nil, fmt.Errorf("locking %s: %w", path, err)
+		}
+		if !time.Now().Before(deadline) {
+			held := recordedPID(f)
+			f.Close()
 			return nil, fmt.Errorf("another daemon is already running (pid %s)", held)
 		}
-		return nil, fmt.Errorf("locking %s: %w", path, err)
+		// Said once, not once per poll: the wait is the interesting part, and
+		// the pid is what a person reading the log will go look for.
+		if !announced {
+			log.Printf("another daemon holds the lock (pid %s); waiting up to %s for it to exit",
+				recordedPID(f), wait)
+			announced = true
+		}
+		time.Sleep(lockPoll)
 	}
 
 	// The pid is written for whoever goes looking in the state directory by
