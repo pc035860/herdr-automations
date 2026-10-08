@@ -158,7 +158,10 @@ automations:
     agent_args: ["--model", "opus"]         # optional, verbatim agent flags
     env:                          # optional: exported into the pane's shell
       MCP_TIMEOUT: "60000"        # before the agent starts, for the knobs it
-                                  # only reads from the environment
+                                  # only reads from the environment;
+                                  # HERDR_AUTOMATION=<name> is always exported
+                                  # (an env entry of that name wins; '' reads
+                                  # as unset to cache-keepalive)
     keep: 1                       # finished runs holding a pane; 0 closes on
                                   # finish, -1 never retires
     keep_failed: 3                # same, for runs that failed

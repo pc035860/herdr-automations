@@ -155,17 +155,31 @@ automations:
 }
 
 func TestEnvExportsAreSortedAndQuoted(t *testing.T) {
-	a := Automation{Env: map[string]string{
+	a := Automation{Name: "nightly", Env: map[string]string{
 		"MCP_TIMEOUT": "60000",
 		"GREETING":    "hello world",
 		"AWKWARD":     "it's fine; rm -rf /",
 	}}
-	got := a.EnvExports()
-	want := []string{
+	assertExports(t, a.EnvExports(), []string{
 		`export AWKWARD='it'\''s fine; rm -rf /'`,
 		`export GREETING='hello world'`,
+		`export HERDR_AUTOMATION='nightly'`,
 		`export MCP_TIMEOUT='60000'`,
-	}
+	})
+}
+
+func TestEnvExportsAlwaysNameTheAutomation(t *testing.T) {
+	assertExports(t, Automation{Name: "pr-triage"}.EnvExports(), []string{
+		`export HERDR_AUTOMATION='pr-triage'`,
+	})
+	overridden := Automation{Name: "pr-triage", Env: map[string]string{"HERDR_AUTOMATION": ""}}
+	assertExports(t, overridden.EnvExports(), []string{
+		`export HERDR_AUTOMATION=''`,
+	})
+}
+
+func assertExports(t *testing.T, got, want []string) {
+	t.Helper()
 	if len(got) != len(want) {
 		t.Fatalf("got %d exports, want %d: %q", len(got), len(want), got)
 	}
@@ -173,9 +187,6 @@ func TestEnvExportsAreSortedAndQuoted(t *testing.T) {
 		if got[i] != want[i] {
 			t.Errorf("export %d:\n got %s\nwant %s", i, got[i], want[i])
 		}
-	}
-	if len(Automation{}.EnvExports()) != 0 {
-		t.Error("an automation without env produced exports")
 	}
 }
 

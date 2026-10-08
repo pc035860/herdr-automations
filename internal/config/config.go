@@ -109,15 +109,24 @@ var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 // always produces the same commands. Values are single-quoted — an embedded
 // quote is closed, escaped and reopened — so a value carrying spaces or shell
 // metacharacters reaches the agent as it was written.
+//
+// HERDR_AUTOMATION always rides along, set to the automation's name, so what
+// runs in the pane can tell a scheduled run from a session someone opened by
+// hand (cache-keepalive skips the former, whose output is read and left). An
+// Env entry of the same name wins.
 func (a Automation) EnvExports() []string {
-	names := make([]string, 0, len(a.Env))
-	for k := range a.Env {
+	env := map[string]string{"HERDR_AUTOMATION": a.Name}
+	for k, v := range a.Env {
+		env[k] = v
+	}
+	names := make([]string, 0, len(env))
+	for k := range env {
 		names = append(names, k)
 	}
 	sort.Strings(names)
 	lines := make([]string, 0, len(names))
 	for _, k := range names {
-		v := strings.ReplaceAll(a.Env[k], "'", `'\''`)
+		v := strings.ReplaceAll(env[k], "'", `'\''`)
 		lines = append(lines, fmt.Sprintf("export %s='%s'", k, v))
 	}
 	return lines
